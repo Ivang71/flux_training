@@ -1,4 +1,5 @@
-import os, asyncio, base64, shutil, random, string, argparse, sys, requests, re, urllib.parse, glob, cv2, insightface, torch, pickle
+import os, asyncio, base64, shutil, random, string, argparse, sys, requests, re, urllib.parse, glob, cv2
+import insightface, torch, pickle, time, bencodepy, hashlib
 from huggingface_hub import login
 from torrentp import TorrentDownloader
 import numpy as np
@@ -21,13 +22,28 @@ os.environ['HF_TOKEN'] = k
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
 
 
-def get_magnet(query):
-    encoded_query = urllib.parse.quote(query)
-    url = f"https://thepiratebay10.info/search/{encoded_query}/1/99/0"
-    r = requests.get(url)
+def torrent_url_to_magnet(torrent_url):
+    r = requests.get(torrent_url)
     r.raise_for_status()
-    m = re.search(r'(magnet:\?[^"]+)', r.text)
-    return m.group(1) if m else None
+    torrent_dict = bencodepy.decode(r.content)
+    info = torrent_dict[b'info']
+    info_encoded = bencodepy.encode(info)
+    info_hash = hashlib.sha1(info_encoded).hexdigest()
+    return f"magnet:?xt=urn:btih:{info_hash}".strip()
+
+def get_magnet(keyword):
+    r = requests.get("https://yts.mx/api/v2/list_movies.json", params={"query_term": keyword})
+    r.raise_for_status()
+    movies = r.json().get('data', {}).get('movies', [])
+    fallback = None
+    for movie in reversed(movies):
+        torrents = movie.get('torrents', [])
+        if torrents and fallback is None:
+            fallback = torrent_url_to_magnet(torrents[0].get('url'))
+        for t in torrents:
+            if t.get('quality') == '1080p':
+                return torrent_url_to_magnet(t.get('url'))
+    return fallback
 
 
 # download & extract frames
@@ -74,14 +90,22 @@ async def extract_frames(name, vid_path):
     await proc_ffmpeg.wait()
 
 
-async def download_extract_frames(magnet_uri):
+async def download_extract_frames(magnet_uri, name, vids_folder):
     save_path = f'./data/{name}'
+    t = time.time()
     await download(save_path, magnet_uri)
+    dTime = round(time.time() - t, 4)
+    print(f'Downloading took {dTime} seconds')
+    
     ext = extract_video(save_path, vids_folder, name)
     vid_path = f"./data/vids/{name + ext}"
+    t = time.time()
     await extract_frames(name, vid_path)
+    eTime = round(time.time() - t, 4)
+    print(f'Frame extraction {eTime} seconds')
     shutil.rmtree(save_path, ignore_errors=True)
     os.remove(vid_path)
+    return dTime, eTime
 
 
 # cluster by character
@@ -89,10 +113,8 @@ async def download_extract_frames(magnet_uri):
 # ----------------------------------------
 # 1) Face detection & embedding setup
 # ----------------------------------------
-face_analysis = insightface.app.FaceAnalysis()
-face_analysis.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.78)
 
-def get_face(image_path):
+def get_face(image_path, face_analysis):
     """
     Returns metadata for the best face in the image, or None if no face.
     Best face is the one with the lowest sum of pairwise cos sims among all faces in the frame (the most unique).
@@ -129,10 +151,13 @@ def extract_metadata(face_obj, image_path):
 # 2) Collect metadata from frames
 # ----------------------------------------
 def get_frames(frames_folder):
+    face_analysis = insightface.app.FaceAnalysis()
+    face_analysis.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.78)
+
     metadata = []
     frame_paths = sorted(glob.glob(os.path.join(frames_folder, "*.jpg")))
     for path in frame_paths:
-        face_data = get_face(path)
+        face_data = get_face(path, face_analysis)
         if face_data is None:
             os.remove(path)
         else:
@@ -142,7 +167,7 @@ def get_frames(frames_folder):
 # ----------------------------------------
 # 3) Clustering by character
 # ----------------------------------------
-def cluster(
+def cluster_by_char(
     face_metadata,
     eps=0.8,
     min_samples=10,
@@ -248,6 +273,13 @@ def cluster(
 
 
 # adding body bounding box and embedding
+device = "cuda"
+gino_model_id = "IDEA-Research/grounding-dino-tiny"
+processor = AutoProcessor.from_pretrained(gino_model_id)
+g_model = AutoModelForZeroShotObjectDetection.from_pretrained(gino_model_id).to(device)
+vision_model_id = "OpenGVLab/InternViT-300M-448px-V2_5"
+vision_model = AutoModel.from_pretrained(vision_model_id, torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
+vision_extractor = AutoFeatureExtractor.from_pretrained(vision_model_id, trust_remote_code=True)
 
 def compute_body_embedding(pil_image):
     inputs = vision_extractor(images=pil_image, return_tensors="pt")
@@ -314,41 +346,43 @@ def main():
     args = parser.parse_args()
 
     name = randStr()
+    name = "bopxYeeJ"
     os.makedirs('data', exist_ok=True)
     vids_folder = "./data/vids"
 
     magnet = get_magnet(args.movie_name) # downloading
-    asyncio.run(download_extract_frames(magnet))
+    dTime, eTime = asyncio.run(download_extract_frames(magnet, name, vids_folder))
 
-    frames_folder = f"./data/raw_frames/{name}" # extracting frames with faces
-    metadata = get_frames(frames_folder)
+    t = time.time()
+    frames_folder = f"./data/raw_frames/{name}"
+    metadata = get_frames(frames_folder) # extracting frames with faces
+    fTime = round(time.time() - t, 4)
     print(f"Collected {len(metadata)} face entries.")
+    print(f'Filtering out frames without faces took {fTime} seconds')
 
-    raw_clusters = cluster(metadata) # clustering by character
+    t = time.time()
+    raw_clusters = cluster_by_char(metadata) # clustering by character
     min_size, max_size = 13, 36
     filtered_clusters = [cluster for cluster in raw_clusters if len(cluster) >= min_size]
     clusters = [random.sample(cluster, min(len(cluster), max_size)) for cluster in filtered_clusters]
     for i, c in enumerate(clusters):
         print(f"Cluster {i} has {len(c)} frames.")
+    cTime = round(time.time() - t, 4)
+    print(f'Clustering took {cTime} seconds')
 
     
-    device = "cuda" # adding body bounding box and body embedding
-    gino_model_id = "IDEA-Research/grounding-dino-tiny"
-    processor = AutoProcessor.from_pretrained(gino_model_id)
-    g_model = AutoModelForZeroShotObjectDetection.from_pretrained(gino_model_id).to(device)
-
-    vision_model_id = "OpenGVLab/InternViT-300M-448px-V2_5"
-    vision_model = AutoModel.from_pretrained(vision_model_id, torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
-    vision_extractor = AutoFeatureExtractor.from_pretrained(vision_model_id, trust_remote_code=True)
-
-    for i, cluster in enumerate(clusters):
+    t = time.time()
+    for i, cluster in enumerate(clusters): # adding body bounding box and body embedding
         for idx in tqdm(cluster, desc=f"Cluster {i}"):
             result = detect_body_bbox_and_embedding(metadata[idx])
             if result is None:
                 metadata[idx]["defective"] = True
             else:
                 metadata[idx] = result
+    bTime = round(time.time() - t, 4)
+    print(f'Processing bodies took {bTime} seconds')
 
+    t = time.time()
     base = join(os.getcwd(), 'data', 'dataset') # add to dataset
     os.makedirs(base, exist_ok=True)
     bundle = get_max_folder_number(base)
@@ -385,10 +419,17 @@ def main():
         with open(join(char_dir, 'char_data.pkl'), 'wb') as f:
             pickle.dump(char_data, f)
         char += 1
-
+    aTime = round(time.time() - t, 4)
 
     print('finished')
     shutil.rmtree(frames_folder, ignore_errors=True)
+    print(f"Downloading took {dTime} seconds")
+    print(f"Extraction took {eTime} seconds")
+    print(f"Filtering took {fTime} seconds")
+    print(f"Clustering took {cTime} seconds")
+    print(f"Body processing took {bTime} seconds")
+    print(f'Adding to dataset took {aTime} seconds')
+
     return 0
 
 
