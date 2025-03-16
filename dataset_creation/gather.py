@@ -365,8 +365,13 @@ def process_movie(movie_name):
 
     magnet = get_magnet(movie_name) # downloading
     if not magnet: return "Unable to get the magnet link"
-    dTime, eTime = asyncio.run(download_extract_frames(magnet, name, vids_folder))
-
+    try:
+        # Wait up to 480 seconds (8 minutes) for the processing to finish.
+        dTime, eTime = asyncio.run(
+            asyncio.wait_for(download_extract_frames(magnet, name, vids_folder), timeout=480)
+        )
+    except asyncio.TimeoutError:
+        return 1
     t = time.time()
     frames_folder = f"./data/raw_frames/{name}"
     metadata = get_frames(frames_folder) # extracting frames with faces
