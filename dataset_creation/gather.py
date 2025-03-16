@@ -32,18 +32,22 @@ def torrent_url_to_magnet(torrent_url):
     return f"magnet:?xt=urn:btih:{info_hash}".strip()
 
 def get_magnet(keyword):
-    r = requests.get("https://yts.mx/api/v2/list_movies.json", params={"query_term": keyword})
-    r.raise_for_status()
-    movies = r.json().get('data', {}).get('movies', [])
-    fallback = None
-    for movie in reversed(movies):
-        torrents = movie.get('torrents', [])
-        if torrents and fallback is None:
-            fallback = torrent_url_to_magnet(torrents[0].get('url'))
-        for t in torrents:
-            if t.get('quality') == '1080p':
-                return torrent_url_to_magnet(t.get('url'))
-    return fallback
+    try:
+        r = requests.get("https://yts.mx/api/v2/list_movies.json", params={"query_term": keyword})
+        r.raise_for_status()
+        movies = r.json().get('data', {}).get('movies', [])
+        fallback = None
+        for movie in reversed(movies):
+            torrents = movie.get('torrents', [])
+            if torrents and fallback is None:
+                fallback = torrent_url_to_magnet(torrents[0].get('url'))
+            for t in torrents:
+                if t.get('quality') == '1080p':
+                    return torrent_url_to_magnet(t.get('url'))
+        return fallback
+    except Exception:
+        return None
+
 
 
 # download & extract frames
@@ -356,11 +360,11 @@ def upload_to_drive():
 
 def process_movie(movie_name):
     name = randStr()
-    name = "bopxYeeJ"
     os.makedirs('data', exist_ok=True)
     vids_folder = "./data/vids"
 
     magnet = get_magnet(movie_name) # downloading
+    if not magnet: return "Unable to get the magnet link"
     dTime, eTime = asyncio.run(download_extract_frames(magnet, name, vids_folder))
 
     t = time.time()
@@ -416,7 +420,7 @@ def process_movie(movie_name):
                 continue
 
             src_path = metadata[mtd_i]['image_path']
-            dest_image_name = f'char_data_{img_index}.jpg'
+            dest_image_name = f'{img_index}.jpg'
             dest_path = join(char_dir, dest_image_name)
 
             shutil.copy2(src_path, dest_path)
@@ -459,11 +463,11 @@ async def main():
     while movies:
         movie = movies.pop(0)
         result = process_movie(movie)
-        if result.returncode == 0:
+        if result == 0:
             print(f"Successfully processed {movie}")
             processed.append(movie)
         else:
-            print(f"Processing error ({result.returncode}) for {movie}")
+            print(f"Processing error ({result}) for {movie}")
         
         with open(movies_path, "w") as f:
             json.dump(movies, f, indent=4)
