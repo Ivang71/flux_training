@@ -469,7 +469,12 @@ async def main():
     
     while movies:
         movie = movies.pop(0)
-        result = process_movie(movie)
+        try:
+            result = process_movie(movie)
+        except Exception as e:
+            print(f"Exception processing {movie}: {e}")
+            result = "something went wrong while processing"
+
         if result == 0:
             print(f"Successfully processed {movie}")
             processed.append(movie)
