@@ -1,5 +1,5 @@
-import os, asyncio, base64, shutil, random, string, argparse, sys, requests, re, urllib.parse, glob, cv2
-import insightface, torch, pickle, time, bencodepy, hashlib
+import os, asyncio, base64, shutil, random, string, argparse, sys, requests, glob, cv2
+import insightface, torch, pickle, time, bencodepy, hashlib,  json, subprocess
 from huggingface_hub import login
 from torrentp import TorrentDownloader
 import numpy as np
@@ -332,6 +332,20 @@ def get_max_folder_number(directory):
     return max((int(d) for d in os.listdir(directory) if d.isdigit() and isdir(join(directory, d))), default=0)
 
 
+def upload_to_drive():
+    DATASET_DIR = "data/dataset"
+    REMOTE_BASE = "drive:dataset"
+    bundles = [d for d in os.listdir(DATASET_DIR)
+               if os.path.isdir(os.path.join(DATASET_DIR, d)) and d.isdigit()]
+    for bundle in bundles:
+        archive_name = f"{bundle}.tar"  # uncompressed archive
+        subprocess.run(["tar", "-cf", archive_name, "-C", DATASET_DIR, bundle], check=True)
+        subprocess.run([
+            "rclone", "copy", archive_name, REMOTE_BASE,
+            "--transfers=32", "--checkers=32", "--fast-list", "--progress"
+        ], check=True)
+        os.remove(archive_name)
+        print(f"Processed and uploaded bundle {bundle}")
 
 
 
@@ -340,17 +354,13 @@ def get_max_folder_number(directory):
 
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Take in a movie name, add structured frames (unlabeled) to the dataset")
-    parser.add_argument("--movie_name", required=True, help="Movie to download")
-    args = parser.parse_args()
-
+def process_movie(movie_name):
     name = randStr()
     name = "bopxYeeJ"
     os.makedirs('data', exist_ok=True)
     vids_folder = "./data/vids"
 
-    magnet = get_magnet(args.movie_name) # downloading
+    magnet = get_magnet(movie_name) # downloading
     dTime, eTime = asyncio.run(download_extract_frames(magnet, name, vids_folder))
 
     t = time.time()
@@ -421,7 +431,6 @@ def main():
         char += 1
     aTime = round(time.time() - t, 4)
 
-    print('finished')
     shutil.rmtree(frames_folder, ignore_errors=True)
     print(f"Downloading took {dTime} seconds")
     print(f"Extraction took {eTime} seconds")
@@ -433,5 +442,45 @@ def main():
     return 0
 
 
+async def main():
+    movies_path = "./movies.json"
+    processed_path = "./processed.json"
+    
+    with open(movies_path, "r") as f:
+        movies = json.load(f)
+    if os.path.exists(processed_path):
+        with open(processed_path, "r") as f:
+            processed = json.load(f)
+    else:
+        processed = []
+    
+    upload_tasks = []
+    
+    while movies:
+        movie = movies.pop(0)
+        result = process_movie(movie)
+        if result.returncode == 0:
+            print(f"Successfully processed {movie}")
+            processed.append(movie)
+        else:
+            print(f"Processing error ({result.returncode}) for {movie}")
+        
+        with open(movies_path, "w") as f:
+            json.dump(movies, f, indent=4)
+        with open(processed_path, "w") as f:
+            json.dump(processed, f, indent=4)
+        
+        # Launch the upload function in the background asynchronously.
+        # This runs upload_to_drive() in a separate thread.
+        task = asyncio.create_task(asyncio.to_thread(upload_to_drive))
+        upload_tasks.append(task)
+        
+        # Optionally yield control so upload can start concurrently.
+        await asyncio.sleep(0)
+    
+    # Wait for all upload tasks to finish before exiting.
+    await asyncio.gather(*upload_tasks)
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(asyncio.run(main()))
