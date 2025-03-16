@@ -22,6 +22,17 @@ os.environ['HF_TOKEN'] = k
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
 
 
+face_analysis = insightface.app.FaceAnalysis()
+face_analysis.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.78)
+
+device = "cuda"
+gino_model_id = "IDEA-Research/grounding-dino-tiny"
+processor = AutoProcessor.from_pretrained(gino_model_id)
+g_model = AutoModelForZeroShotObjectDetection.from_pretrained(gino_model_id).to(device)
+vision_model_id = "OpenGVLab/InternViT-300M-448px-V2_5"
+vision_model = AutoModel.from_pretrained(vision_model_id, torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
+vision_extractor = AutoFeatureExtractor.from_pretrained(vision_model_id, trust_remote_code=True)
+
 def torrent_url_to_magnet(torrent_url):
     r = requests.get(torrent_url)
     r.raise_for_status()
@@ -33,19 +44,20 @@ def torrent_url_to_magnet(torrent_url):
 
 def get_magnet(keyword):
     try:
-        r = requests.get("https://yts.mx/api/v2/list_movies.json", params={"query_term": keyword})
+        params = {
+            "query_term": keyword,
+            "sort_by": "peers",
+            "order_by": "desc",
+            "limit": 50
+        }
+        r = requests.get("https://yts.mx/api/v2/list_movies.json", params=params)
         r.raise_for_status()
         movies = r.json().get('data', {}).get('movies', [])
-        fallback = None
-        for movie in reversed(movies):
-            torrents = movie.get('torrents', [])
-            if torrents and fallback is None:
-                fallback = torrent_url_to_magnet(torrents[0].get('url'))
-            for t in torrents:
-                if t.get('quality') == '1080p':
-                    return torrent_url_to_magnet(t.get('url'))
-        return fallback
-    except Exception:
+        torrents = [t for movie in movies for t in movie.get('torrents', [])]
+        best = max(torrents, key=lambda t: int(t.get('peers', 0)), default=None)
+        return torrent_url_to_magnet(best.get('url')) if best else None
+    except Exception as e:
+        print("Error:", e)
         return None
 
 
@@ -81,6 +93,7 @@ async def extract_frames(name, vid_path):
 
     ffmpeg_cmd = [
         "ffmpeg",
+        "-hide_banner",
         "-hwaccel", "cuda",
         "-c:v", "h264_cuvid",
         "-i", vid_path,
@@ -118,7 +131,7 @@ async def download_extract_frames(magnet_uri, name, vids_folder):
 # 1) Face detection & embedding setup
 # ----------------------------------------
 
-def get_face(image_path, face_analysis):
+def get_face(image_path):
     """
     Returns metadata for the best face in the image, or None if no face.
     Best face is the one with the lowest sum of pairwise cos sims among all faces in the frame (the most unique).
@@ -155,13 +168,10 @@ def extract_metadata(face_obj, image_path):
 # 2) Collect metadata from frames
 # ----------------------------------------
 def get_frames(frames_folder):
-    face_analysis = insightface.app.FaceAnalysis()
-    face_analysis.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.78)
-
     metadata = []
     frame_paths = sorted(glob.glob(os.path.join(frames_folder, "*.jpg")))
     for path in frame_paths:
-        face_data = get_face(path, face_analysis)
+        face_data = get_face(path)
         if face_data is None:
             os.remove(path)
         else:
@@ -277,14 +287,6 @@ def cluster_by_char(
 
 
 # adding body bounding box and embedding
-device = "cuda"
-gino_model_id = "IDEA-Research/grounding-dino-tiny"
-processor = AutoProcessor.from_pretrained(gino_model_id)
-g_model = AutoModelForZeroShotObjectDetection.from_pretrained(gino_model_id).to(device)
-vision_model_id = "OpenGVLab/InternViT-300M-448px-V2_5"
-vision_model = AutoModel.from_pretrained(vision_model_id, torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
-vision_extractor = AutoFeatureExtractor.from_pretrained(vision_model_id, trust_remote_code=True)
-
 def compute_body_embedding(pil_image):
     inputs = vision_extractor(images=pil_image, return_tensors="pt")
     inputs = {k: v.to(torch.bfloat16).to(device) for k, v in inputs.items()}
