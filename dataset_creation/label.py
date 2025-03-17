@@ -1,19 +1,23 @@
-import os, asyncio, base64, sys, pickle, time, json
+import os, asyncio, base64, sys, pickle, json
 import numpy as np
 from PIL import Image
 from huggingface_hub import login
 from lmdeploy import pipeline, TurbomindEngineConfig
 from lmdeploy.vl import load_image
-from os.path import join, isdir
+from os.path import join
+import logging
 import nest_asyncio
 nest_asyncio.apply()
 
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 k = base64.b64decode('aGZfaHZqck9VTXFvTXF3dW9HR3JoTlZKSWlsZUtFTlNQbXRjTw==').decode()
 login(token=k, add_to_git_credential=False)
 os.environ['HUGGINGFACEHUB_API_TOKEN'] = k
 os.environ['HF_TOKEN'] = k
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
+logging.info("Logged into Hugging Face.")
 
 
 pipe = pipeline('OpenGVLab/InternVL2_5-26B-MPO-AWQ', backend_config=TurbomindEngineConfig(device_type='cuda', session_len=14336))
@@ -30,62 +34,72 @@ Indicate the style of the image (e.g., cartoon, photograph, 3D render) and avoid
 
 
 async def process_char_dir(char_dir):
-    pkl_path = os.path.join(char_dir, "char_data.pkl")
+    logging.info(f"Processing character directory: {char_dir}")
+    pkl_path = join(char_dir, "char_data.pkl")
     with open(pkl_path, "rb") as f:
         char_data = pickle.load(f)
-
+    
     if all("label" in item for item in char_data):
+        logging.info(f"All labels present in {char_dir}; skipping.")
         return 0
 
-    img_paths = [os.path.join(char_dir, f) for f in os.listdir(char_dir) if f.lower().endswith(('.jpg'))]
-    img_paths.sort()
+    img_paths = sorted([join(char_dir, f) for f in os.listdir(char_dir) if f.lower().endswith('.jpg')])
+    logging.info(f"Found {len(img_paths)} images in {char_dir}")
     tasks = [asyncio.to_thread(load_image, img_path) for img_path in img_paths]
     imgs = await asyncio.gather(*tasks)
     prompts = [(prompt, img) for img in imgs]
 
     labels = []
     for i in range(0, len(prompts), 10):
-        labels_batch = [res.text for res in pipe(prompts[i:i+10])]
-        print(labels_batch)
+        batch = prompts[i:i+10]
+        logging.info(f"Processing batch {i//10} in {char_dir}")
+        # Assuming pipe returns objects with a 'text' attribute.
+        labels_batch = [res.text for res in pipe(batch)]
+        logging.info(f"Batch {i//10} produced {len(labels_batch)} labels")
         labels.extend(labels_batch)
     
-    for i, label in enumerate(labels):
+    for i, lab in enumerate(labels):
         if i < len(char_data):
-            char_data[i]["label"] = label
+            char_data[i]["label"] = lab
         else:
-            print(f"Warning: No corresponding char_data element for index {i}")
-
-    # for item in char_data:
-    #     item["face_embedding"] = []
-    #     item["body_embedding"] = []
-
-    # def default_converter(o):
-    #     if isinstance(o, np.ndarray):
-    #         return o.tolist()
-    #     raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
-
-    # print(json.dumps(char_data, default=default_converter))
-    # await asyncio.sleep(2000)
+            logging.warning(f"No corresponding char_data element for index {i} in {char_dir}")
     
     with open(pkl_path, "wb") as f:
         pickle.dump(char_data, f)
+    logging.info(f"Finished processing {char_dir}")
     return 0
 
 
 
 async def process_bundle(bundle):
+    logging.info(f"Processing bundle: {bundle}")
     info_path = join(bundle, "info.json")
-    info = json.load(open(info_path)) if os.path.exists(info_path) else {"all_labeled": False, "labeled": []}
+    if os.path.exists(info_path):
+        # Load and convert any existing labeled indices to integers
+        info = json.load(open(info_path))
+        info["labeled"] = [int(x) for x in info.get("labeled", [])]
+    else:
+        info = {"all_labeled": False, "labeled": []}    
     if info.get("all_labeled"):
-        return
+        logging.info(f"Bundle {bundle} is fully labeled; skipping.")
+        return    
     # Process character directories sorted numerically.
     for d in sorted([d for d in os.listdir(bundle) if os.path.isdir(join(bundle, d)) and d.isdigit()], key=lambda d: int(d)):
-        if d not in info["labeled"]:
-            await process_char_dir(join(bundle, d))
-            info["labeled"].append(d)
-    if "999" in info["labeled"]:
-        info["all_labeled"] = True
-    json.dump(info, open(info_path, "w"), indent=4)
+        num_d = int(d)
+        if num_d not in info["labeled"]:
+            char_path = join(bundle, d)
+            logging.info(f"Processing character {d} in bundle {bundle}")
+            await process_char_dir(char_path)
+            info["labeled"].append(num_d)
+            with open(info_path, "w") as f:
+                json.dump(info, f, indent=4)   
+    if 999 in info["labeled"]:
+        info["all_labeled"] = True    
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=4)
+    logging.info(f"Final bundle info for {bundle}: {info}")
+
+
 
 async def poll_bundles(base):
     while True:
@@ -93,12 +107,13 @@ async def poll_bundles(base):
             bundle = join(base, d)
             if os.path.isdir(bundle):
                 await process_bundle(bundle)
-        wait = 13
-        print(f'nothing to process, waiting for {wait} seconds')
-        await asyncio.sleep(wait)
+        logging.info("Nothing to process; waiting 13 seconds for updates.")
+        await asyncio.sleep(13)
+
 
 async def main():
     base_dir = "./data/dataset"
+    logging.info("Starting bundle polling.")
     await poll_bundles(base_dir)
 
 
