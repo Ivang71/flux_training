@@ -1,11 +1,8 @@
-import os, asyncio, base64, sys, pickle, json
-import numpy as np
-from PIL import Image
+import os, asyncio, base64, sys, pickle, json, logging
 from huggingface_hub import login
 from lmdeploy import pipeline, TurbomindEngineConfig
 from lmdeploy.vl import load_image
 from os.path import join
-import logging
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -17,7 +14,6 @@ login(token=k, add_to_git_credential=False)
 os.environ['HUGGINGFACEHUB_API_TOKEN'] = k
 os.environ['HF_TOKEN'] = k
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
-logging.info("Logged into Hugging Face.")
 
 
 pipe = pipeline('OpenGVLab/InternVL2_5-26B-MPO-AWQ', backend_config=TurbomindEngineConfig(device_type='cuda', session_len=14336))

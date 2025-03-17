@@ -1,5 +1,5 @@
-import os, asyncio, base64, shutil, random, string, argparse, sys, requests, glob, cv2
-import insightface, torch, pickle, time, bencodepy, hashlib,  json, subprocess
+import os, asyncio, base64, shutil, random, string, logging, sys, requests, glob, cv2, re
+import insightface, torch, pickle, time, bencodepy, hashlib,  json, subprocess, multiprocessing
 from huggingface_hub import login
 from torrentp import TorrentDownloader
 import numpy as np
@@ -21,6 +21,8 @@ os.environ['HUGGINGFACEHUB_API_TOKEN'] = k
 os.environ['HF_TOKEN'] = k
 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = "1"
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+    filename="gather.log", filemode="w")
 
 face_analysis = insightface.app.FaceAnalysis()
 face_analysis.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.78)
@@ -33,43 +35,48 @@ vision_model_id = "OpenGVLab/InternViT-300M-448px-V2_5"
 vision_model = AutoModel.from_pretrained(vision_model_id, torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
 vision_extractor = AutoFeatureExtractor.from_pretrained(vision_model_id, trust_remote_code=True)
 
-def torrent_url_to_magnet(torrent_url):
-    r = requests.get(torrent_url)
-    r.raise_for_status()
-    torrent_dict = bencodepy.decode(r.content)
-    info = torrent_dict[b'info']
-    info_encoded = bencodepy.encode(info)
-    info_hash = hashlib.sha1(info_encoded).hexdigest()
-    return f"magnet:?xt=urn:btih:{info_hash}".strip()
-
-def get_magnet(keyword):
-    try:
-        params = {
-            "query_term": keyword,
-            "sort_by": "peers",
-            "order_by": "desc",
-            "limit": 50
-        }
-        r = requests.get("https://yts.mx/api/v2/list_movies.json", params=params)
-        r.raise_for_status()
-        movies = r.json().get('data', {}).get('movies', [])
-        torrents = [t for movie in movies for t in movie.get('torrents', [])]
-        best = max(torrents, key=lambda t: int(t.get('peers', 0)), default=None)
-        return torrent_url_to_magnet(best.get('url')) if best else None
-    except Exception as e:
-        print("Error:", e)
-        return None
-
-
 
 # download & extract frames
 def randStr(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
-async def download(save_path, magnet_uri):
-    torrent_file = TorrentDownloader(magnet_uri, save_path=save_path)
-    await torrent_file.start_download()
+def get_url(keyword):
+    try:
+        params = {"query_term": keyword, "sort_by": "peers", "order_by": "desc", "limit": 50}
+        r = requests.get("https://yts.mx/api/v2/list_movies.json", params=params)
+        r.raise_for_status()
+        movies = r.json().get('data', {}).get('movies', [])
+        best = max(
+            (torrent for movie in movies for torrent in movie["torrents"]),
+            key=lambda t: t["peers"]
+        )
+        return best['url']
+    except Exception as e:
+        logging.info("Error:", e)
+        return None
+
+def download_sync(movie_name, save_path):
+    os.makedirs('temp', exist_ok=True)
+    torrent_file = f"temp/{re.sub(r'[^a-zA-Z0-9_.-]', '_', movie_name)}.torrent"
+    url = get_url(movie_name)
+    with open(torrent_file, "wb") as f:
+        f.write(requests.get(url).content)
+    torrent = TorrentDownloader(torrent_file, save_path)
+    asyncio.run(torrent.start_download())
+    os.remove(torrent_file)
+
+async def download(save_path, movie_name, timeout=360):
+    print(movie_name, save_path)
+    proc = multiprocessing.Process(target=download_sync, args=(movie_name, save_path))
+    proc.start()
+    try:
+        await asyncio.wait_for(asyncio.to_thread(proc.join), timeout)
+    except asyncio.TimeoutError:
+        logging.info(f"Timeout of {timeout}s reached; aborting download.")
+        proc.terminate()
+        proc.join()
+
 
 
 def extract_video(source_folder, target_folder, name):
@@ -107,19 +114,19 @@ async def extract_frames(name, vid_path):
     await proc_ffmpeg.wait()
 
 
-async def download_extract_frames(magnet_uri, name, vids_folder):
+async def download_extract_frames(movie_name, name, vids_folder):
     save_path = f'./data/{name}'
     t = time.time()
-    await download(save_path, magnet_uri)
+    await download(save_path, movie_name)
     dTime = round(time.time() - t, 4)
-    print(f'Downloading took {dTime} seconds')
+    logging.info(f'Downloading took {dTime} seconds')
     
     ext = extract_video(save_path, vids_folder, name)
     vid_path = f"./data/vids/{name + ext}"
     t = time.time()
     await extract_frames(name, vid_path)
     eTime = round(time.time() - t, 4)
-    print(f'Frame extraction {eTime} seconds')
+    logging.info(f'Frame extraction {eTime} seconds')
     shutil.rmtree(save_path, ignore_errors=True)
     os.remove(vid_path)
     return dTime, eTime
@@ -351,7 +358,7 @@ def upload_to_drive():
             "--checksum", "--transfers=32", "--checkers=32", "--fast-list", "--progress"
         ], check=True)
         os.remove(archive_name)
-        print(f"Processed and uploaded bundle {bundle}")
+        logging.info(f"Processed and uploaded bundle {bundle}")
 
 
 
@@ -365,12 +372,10 @@ def process_movie(movie_name):
     os.makedirs('data', exist_ok=True)
     vids_folder = "./data/vids"
 
-    magnet = get_magnet(movie_name) # downloading
-    if not magnet: return "Unable to get the magnet link"
     try:
         # Wait up to 480 seconds (8 minutes) for the processing to finish.
         dTime, eTime = asyncio.run(
-            asyncio.wait_for(download_extract_frames(magnet, name, vids_folder), timeout=480)
+            asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=480)
         )
     except asyncio.TimeoutError:
         return 1
@@ -378,8 +383,8 @@ def process_movie(movie_name):
     frames_folder = f"./data/raw_frames/{name}"
     metadata = get_frames(frames_folder) # extracting frames with faces
     fTime = round(time.time() - t, 4)
-    print(f"Collected {len(metadata)} face entries.")
-    print(f'Filtering out frames without faces took {fTime} seconds')
+    logging.info(f"Collected {len(metadata)} face entries.")
+    logging.info(f'Filtering out frames without faces took {fTime} seconds')
 
     t = time.time()
     raw_clusters = cluster_by_char(metadata) # clustering by character
@@ -387,9 +392,9 @@ def process_movie(movie_name):
     filtered_clusters = [cluster for cluster in raw_clusters if len(cluster) >= min_size]
     clusters = [random.sample(cluster, min(len(cluster), max_size)) for cluster in filtered_clusters]
     for i, c in enumerate(clusters):
-        print(f"Cluster {i} has {len(c)} frames.")
+        logging.info(f"Cluster {i} has {len(c)} frames.")
     cTime = round(time.time() - t, 4)
-    print(f'Clustering took {cTime} seconds')
+    logging.info(f'Clustering took {cTime} seconds')
 
     
     t = time.time()
@@ -401,7 +406,7 @@ def process_movie(movie_name):
             else:
                 metadata[idx] = result
     bTime = round(time.time() - t, 4)
-    print(f'Processing bodies took {bTime} seconds')
+    logging.info(f'Processing bodies took {bTime} seconds')
 
     t = time.time()
     base = join(os.getcwd(), 'data', 'dataset') # add to dataset
@@ -446,12 +451,12 @@ def process_movie(movie_name):
     aTime = round(time.time() - t, 4)
 
     shutil.rmtree(frames_folder, ignore_errors=True)
-    print(f"Downloading took {dTime} seconds")
-    print(f"Extraction took {eTime} seconds")
-    print(f"Filtering took {fTime} seconds")
-    print(f"Clustering took {cTime} seconds")
-    print(f"Body processing took {bTime} seconds")
-    print(f'Adding to dataset took {aTime} seconds')
+    logging.info(f"Downloading took {dTime} seconds")
+    logging.info(f"Extraction took {eTime} seconds")
+    logging.info(f"Filtering took {fTime} seconds")
+    logging.info(f"Clustering took {cTime} seconds")
+    logging.info(f"Body processing took {bTime} seconds")
+    logging.info(f'Adding to dataset took {aTime} seconds')
 
     return 0
 
@@ -475,14 +480,14 @@ async def main():
         try:
             result = process_movie(movie)
         except Exception as e:
-            print(f"Exception processing {movie}: {e}")
+            logging.info(f"Exception processing {movie}: {e}")
             result = "something went wrong while processing"
 
         if result == 0:
-            print(f"Successfully processed {movie}")
+            logging.info(f"Successfully processed {movie}")
             processed.append({"title": movie, "labeled": False})
         else:
-            print(f"Processing error ({result}) for {movie}")
+            logging.info(f"Processing error ({result}) for {movie}")
         
         with open(movies_path, "w") as f:
             json.dump(movies, f, indent=4)
