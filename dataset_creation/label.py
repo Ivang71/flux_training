@@ -4,6 +4,7 @@ from PIL import Image
 from huggingface_hub import login
 from lmdeploy import pipeline, TurbomindEngineConfig
 from lmdeploy.vl import load_image
+from os.path import join, isdir
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -71,19 +72,35 @@ async def process_char_dir(char_dir):
     return 0
 
 
+
+async def process_bundle(bundle):
+    info_path = join(bundle, "info.json")
+    info = json.load(open(info_path)) if os.path.exists(info_path) else {"all_labeled": False, "labeled": []}
+    if info.get("all_labeled"):
+        return
+    # Process character directories sorted numerically.
+    for d in sorted([d for d in os.listdir(bundle) if os.path.isdir(join(bundle, d)) and d.isdigit()], key=lambda d: int(d)):
+        if d not in info["labeled"]:
+            await process_char_dir(join(bundle, d))
+            info["labeled"].append(d)
+    if "999" in info["labeled"]:
+        info["all_labeled"] = True
+    json.dump(info, open(info_path, "w"), indent=4)
+
+async def poll_bundles(base):
+    while True:
+        for d in os.listdir(base):
+            bundle = join(base, d)
+            if os.path.isdir(bundle):
+                await process_bundle(bundle)
+        wait = 13
+        print(f'nothing to process, waiting for {wait} seconds')
+        await asyncio.sleep(wait)
+
 async def main():
     base_dir = "./data/dataset"
-    # Traverse each bundle directory
-    for bundle in os.listdir(base_dir):
-        bundle_dir = os.path.join(base_dir, bundle)
-        if os.path.isdir(bundle_dir):
-            # Traverse each character directory within the bundle
-            for char in os.listdir(bundle_dir):
-                char_dir = os.path.join(bundle_dir, char)
-                if os.path.isdir(char_dir) and "char_data.pkl" in os.listdir(char_dir):
-                    print(f"Processing {char_dir}...")
-                    await process_char_dir(char_dir)
+    await poll_bundles(base_dir)
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    asyncio.run(main())

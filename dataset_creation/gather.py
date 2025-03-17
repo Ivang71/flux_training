@@ -414,7 +414,10 @@ def process_movie(movie_name):
         if char > 999:
             bundle += 1
             char = 0
-            os.makedirs(join(base, str(bundle)), exist_ok=True)
+            new_folder = join(base, str(bundle))
+            os.makedirs(new_folder, exist_ok=True)
+            with open(join(new_folder, "info.json"), "w") as f:
+                json.dump({"all_labeled": False, "labeled": []}, f)
 
         char_dir = join(base, str(bundle), str(char))
         os.makedirs(char_dir, exist_ok=True)
@@ -477,7 +480,7 @@ async def main():
 
         if result == 0:
             print(f"Successfully processed {movie}")
-            processed.append(movie)
+            processed.append({"title": movie, "labeled": False})
         else:
             print(f"Processing error ({result}) for {movie}")
         
