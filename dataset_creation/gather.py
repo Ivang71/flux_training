@@ -348,7 +348,7 @@ def upload_to_drive():
         subprocess.run(["tar", "-cf", archive_name, "-C", DATASET_DIR, bundle], check=True)
         subprocess.run([
             "rclone", "copy", archive_name, REMOTE_BASE,
-            "--transfers=32", "--checkers=32", "--fast-list", "--progress"
+            "--checksum", "--transfers=32", "--checkers=32", "--fast-list", "--progress"
         ], check=True)
         os.remove(archive_name)
         print(f"Processed and uploaded bundle {bundle}")
