@@ -12,8 +12,11 @@ from tqdm import tqdm
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, AutoModel, AutoFeatureExtractor
 from os.path import join, isdir
 from copy import deepcopy
+import warnings
 import nest_asyncio
 nest_asyncio.apply()
+
+warnings.simplefilter("ignore", FutureWarning)
 
 k = base64.b64decode('aGZfaHZqck9VTXFvTXF3dW9HR3JoTlZKSWlsZUtFTlNQbXRjTw==').decode()
 login(token=k, add_to_git_credential=False)
@@ -66,8 +69,7 @@ def download_sync(movie_name, save_path):
     asyncio.run(torrent.start_download())
     os.remove(torrent_file)
 
-async def download(save_path, movie_name, timeout=360):
-    print(movie_name, save_path)
+async def download(movie_name, save_path, timeout=360):
     proc = multiprocessing.Process(target=download_sync, args=(movie_name, save_path))
     proc.start()
     try:
@@ -93,31 +95,43 @@ def extract_video(source_folder, target_folder, name):
                 return ext # Stop after moving the first found video file
 
 
-async def extract_frames(name, vid_path):
-    mkdir_cmd = ["mkdir", "-p", f"./data/raw_frames/{name}"]
-    proc_mkdir = await asyncio.create_subprocess_exec(*mkdir_cmd)
-    await proc_mkdir.wait()
+def get_video_duration(v):
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", v]
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+    return float(json.loads(out)['format']['duration'])
 
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-hwaccel", "cuda",
-        "-c:v", "h264_cuvid",
-        "-i", vid_path,
-        "-vf", "select='not(mod(n,50))'",
-        "-q:v", "2",
-        "-vsync", "0",
-        "-threads", "0",
-        f"./data/raw_frames/{name}/frame_%04d.jpg"
-    ]
-    proc_ffmpeg = await asyncio.create_subprocess_exec(*ffmpeg_cmd)
-    await proc_ffmpeg.wait()
+async def extract_segment(name, v, s, d, idx):
+    od = f"./data/raw_frames/{name}/segment_{idx}"
+    os.makedirs(od, exist_ok=True)
+    cmd = ["ffmpeg", "-hide_banner", "-hwaccel", "cuda", "-c:v", "h264_cuvid", "-ss", str(s), "-t", str(d),
+           "-i", v, "-vf", "fps=0.5", "-q:v", "2", "-vsync", "0", "-threads", "0", f"{od}/frame_%04d.jpg"]
+    proc = await asyncio.create_subprocess_exec(*cmd)
+    await proc.wait()
+
+def merge_frames(name, parts):
+    bd = f"./data/raw_frames/{name}"
+    cnt = 1
+    for i in range(1, parts + 1):
+        seg = os.path.join(bd, f"segment_{i}")
+        for f in sorted(glob.glob(os.path.join(seg, '*.jpg'))):
+            shutil.move(f, os.path.join(bd, f"frame_{cnt:04d}.jpg"))
+            cnt += 1
+        os.rmdir(seg)
+
+async def extract_frames(name, v, parts=8):
+    bd = f"./data/raw_frames/{name}"
+    os.makedirs(bd, exist_ok=True)
+    total = get_video_duration(v)
+    d = total / parts
+    tasks = [asyncio.create_task(extract_segment(name, v, i * d, d, i + 1)) for i in range(parts)]
+    await asyncio.gather(*tasks)
+    merge_frames(name, parts)
 
 
 async def download_extract_frames(movie_name, name, vids_folder):
     save_path = f'./data/{name}'
     t = time.time()
-    await download(save_path, movie_name)
+    await download(movie_name, save_path)
     dTime = round(time.time() - t, 4)
     logging.info(f'Downloading took {dTime} seconds')
     
@@ -126,7 +140,7 @@ async def download_extract_frames(movie_name, name, vids_folder):
     t = time.time()
     await extract_frames(name, vid_path)
     eTime = round(time.time() - t, 4)
-    logging.info(f'Frame extraction {eTime} seconds')
+    logging.info(f'Frame extraction took {eTime} seconds')
     shutil.rmtree(save_path, ignore_errors=True)
     os.remove(vid_path)
     return dTime, eTime
@@ -369,18 +383,20 @@ def upload_to_drive():
 
 def process_movie(movie_name):
     name = randStr()
+    name = "ipIUAtwG" # DEV ONLY
     os.makedirs('data', exist_ok=True)
     vids_folder = "./data/vids"
 
     try:
-        # Wait up to 480 seconds (8 minutes) for the processing to finish.
+        # Wait up to 720 seconds (12 minutes) for the processing to finish.
         dTime, eTime = asyncio.run(
-            asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=480)
+            # asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=720)
         )
     except asyncio.TimeoutError:
-        return 1
+        return "download_extract_frames timeout"
     t = time.time()
     frames_folder = f"./data/raw_frames/{name}"
+    logging.info(f"Collecting face entries...")
     metadata = get_frames(frames_folder) # extracting frames with faces
     fTime = round(time.time() - t, 4)
     logging.info(f"Collected {len(metadata)} face entries.")
@@ -396,7 +412,6 @@ def process_movie(movie_name):
     cTime = round(time.time() - t, 4)
     logging.info(f'Clustering took {cTime} seconds')
 
-    
     t = time.time()
     for i, cluster in enumerate(clusters): # adding body bounding box and body embedding
         for idx in tqdm(cluster, desc=f"Cluster {i}"):
@@ -485,7 +500,7 @@ async def main():
 
         if result == 0:
             logging.info(f"Successfully processed {movie}")
-            processed.append({"title": movie, "labeled": False})
+            processed.append(movie)
         else:
             logging.info(f"Processing error ({result}) for {movie}")
         
