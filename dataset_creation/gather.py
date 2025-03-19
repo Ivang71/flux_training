@@ -368,14 +368,13 @@ def get_max_folder_number(directory):
 
 def process_movie(movie_name):
     name = randStr()
-    name = "ipIUAtwG" # DEV ONLY
     os.makedirs('data', exist_ok=True)
     vids_folder = "./data/vids"
 
     try:
         # Wait up to 12 minutes for the processing to finish.
         dTime, eTime = asyncio.run(
-            # asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=12*60)
+            asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=12*60)
         )
     except asyncio.TimeoutError:
         return "download_extract_frames timeout"
@@ -389,7 +388,7 @@ def process_movie(movie_name):
 
     t = time.time()
     raw_clusters = cluster_by_char(metadata) # clustering by character
-    min_size, max_size = 13, 36
+    min_size, max_size = 13, 26
     filtered_clusters = [cluster for cluster in raw_clusters if len(cluster) >= min_size]
     clusters = [random.sample(cluster, min(len(cluster), max_size)) for cluster in filtered_clusters]
     for i, c in enumerate(clusters):
