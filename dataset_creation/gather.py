@@ -40,6 +40,40 @@ vision_model = AutoModel.from_pretrained(vision_model_id, torch_dtype=torch.bflo
 vision_extractor = AutoFeatureExtractor.from_pretrained(vision_model_id, trust_remote_code=True)
 
 
+
+async def upload_bundle(bundle, local, remote):
+    archive = f"{bundle}.tar"
+    proc = await asyncio.create_subprocess_exec(
+        "tar", "-cf", archive, "-C", local, bundle,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+    proc = await asyncio.create_subprocess_exec(
+        "rclone", "copy", archive, remote,
+        "--checksum", "--transfers=64", "--checkers=64",
+        "--fast-list", "--multi-thread-streams=4", "--progress",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+    os.remove(archive)
+    logging.info(f"Processed and uploaded bundle {bundle}")
+
+
+async def upload_to_drive(stage=0):
+    local = "data/dataset"
+    remote = f"drive:dataset/stage_{stage}"
+    bundles = [d for d in os.listdir(local) if os.path.isdir(os.path.join(local, d)) and d.isdigit()]
+    if bundles:
+        await asyncio.gather(*(upload_bundle(bundle, local, remote) for bundle in bundles))
+
+
+async def sync_loop():
+    while True:
+        await upload_to_drive(0)
+        await asyncio.sleep(12*60)
+
+
+
 # download & extract frames
 def randStr(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -506,4 +540,10 @@ async def main():
 
 
 if __name__ == '__main__':
-    sys.exit(asyncio.run(main()))
+    async def runner():
+        sync_task = asyncio.create_task(sync_loop())
+        result = await main()
+        sync_task.cancel()
+        return result
+
+    sys.exit(asyncio.run(runner()))
