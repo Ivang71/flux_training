@@ -14,8 +14,8 @@ from os.path import join, isdir
 from copy import deepcopy
 import warnings
 from utils import upload_to_drive
-import nest_asyncio
-nest_asyncio.apply()
+# import nest_asyncio
+# nest_asyncio.apply()
 
 # asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -402,28 +402,28 @@ def get_max_folder_number(directory):
 
 
 
-def process_movie(movie_name):
+async def process_movie(movie_name):
     name = randStr()
     os.makedirs('data', exist_ok=True)
     vids_folder = "./data/vids"
 
     try:
         # Wait up to 12 minutes for the processing to finish.
-        dTime, eTime = asyncio.run(
-            asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=12*60)
+        dTime, eTime = await asyncio.wait_for(
+            download_extract_frames(movie_name, name, vids_folder), timeout=12*60
         )
     except asyncio.TimeoutError:
         return "download_extract_frames timeout"
     t = time.time()
     frames_folder = f"./data/raw_frames/{name}"
     logging.info(f"Collecting face entries...")
-    metadata = get_frames(frames_folder) # extracting frames with faces
+    metadata = await asyncio.to_thread(get_frames, frames_folder) # extracting frames with faces
     fTime = round(time.time() - t, 4)
     logging.info(f"Collected {len(metadata)} face entries.")
     logging.info(f'Filtering out frames without faces took {fTime} seconds')
 
     t = time.time()
-    raw_clusters = cluster_by_char(metadata) # clustering by character
+    raw_clusters = await asyncio.to_thread(cluster_by_char, metadata) # clustering by character
     min_size, max_size = 13, 26
     filtered_clusters = [cluster for cluster in raw_clusters if len(cluster) >= min_size]
     clusters = [random.sample(cluster, min(len(cluster), max_size)) for cluster in filtered_clusters]
@@ -435,7 +435,7 @@ def process_movie(movie_name):
     t = time.time()
     for i, cluster in enumerate(clusters): # adding body bounding box and body embedding
         for idx in tqdm(cluster, desc=f"Cluster {i}"):
-            result = detect_body_bbox_and_embedding(metadata[idx])
+            result = await asyncio.to_thread(detect_body_bbox_and_embedding, metadata[idx])
             if result is None:
                 metadata[idx]["defective"] = True
             else:
@@ -513,7 +513,7 @@ async def main():
     while movies:
         movie = movies.pop(0)
         try:
-            result = process_movie(movie)
+            result = await process_movie(movie)
         except Exception as e:
             logging.exception(f"Exception processing {movie}: {e}")
             result = "something went wrong while processing"
