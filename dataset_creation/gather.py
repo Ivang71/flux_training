@@ -13,6 +13,7 @@ from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, Aut
 from os.path import join, isdir
 from copy import deepcopy
 import warnings
+from utils import upload_to_drive
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -359,22 +360,6 @@ def get_max_folder_number(directory):
     return max((int(d) for d in os.listdir(directory) if d.isdigit() and isdir(join(directory, d))), default=0)
 
 
-def upload_to_drive():
-    DATASET_DIR = "data/dataset"
-    REMOTE_BASE = "drive:dataset"
-    bundles = [d for d in os.listdir(DATASET_DIR)
-               if os.path.isdir(os.path.join(DATASET_DIR, d)) and d.isdigit()]
-    for bundle in bundles:
-        archive_name = f"{bundle}.tar"  # uncompressed archive
-        subprocess.run(["tar", "-cf", archive_name, "-C", DATASET_DIR, bundle], check=True)
-        subprocess.run([
-            "rclone", "copy", archive_name, REMOTE_BASE,
-            "--checksum", "--transfers=32", "--checkers=32", "--fast-list", "--progress"
-        ], check=True)
-        os.remove(archive_name)
-        logging.info(f"Processed and uploaded bundle {bundle}")
-
-
 
 
 
@@ -388,9 +373,9 @@ def process_movie(movie_name):
     vids_folder = "./data/vids"
 
     try:
-        # Wait up to 720 seconds (12 minutes) for the processing to finish.
+        # Wait up to 12 minutes for the processing to finish.
         dTime, eTime = asyncio.run(
-            # asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=720)
+            # asyncio.wait_for(download_extract_frames(movie_name, name, vids_folder), timeout=12*60)
         )
     except asyncio.TimeoutError:
         return "download_extract_frames timeout"
@@ -510,8 +495,8 @@ async def main():
             json.dump(processed, f, indent=4)
         
         # Launch the upload function in the background asynchronously.
-        # This runs upload_to_drive() in a separate thread.
-        task = asyncio.create_task(asyncio.to_thread(upload_to_drive))
+        # This runs upload_to_drive(0) in a separate thread.
+        task = asyncio.create_task(asyncio.to_thread(upload_to_drive, 0))
         upload_tasks.append(task)
         
         # Optionally yield control so upload can start concurrently.
