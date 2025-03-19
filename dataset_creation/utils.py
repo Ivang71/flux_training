@@ -3,16 +3,17 @@ import insightface, torch, pickle, time, bencodepy, hashlib,  json, subprocess, 
 
 
 def upload_to_drive(stage=0):
-    DATASET_DIR = "data/dataset"
-    REMOTE_BASE = f"drive:dataset_stage_{stage}"
-    bundles = [d for d in os.listdir(DATASET_DIR)
-               if os.path.isdir(os.path.join(DATASET_DIR, d)) and d.isdigit()]
+    LOCAL = "data/dataset"
+    REMOTE = f"drive:dataset/stage_{stage}"
+    bundles = [d for d in os.listdir(LOCAL)
+               if os.path.isdir(os.path.join(LOCAL, d)) and d.isdigit()]
     for bundle in bundles:
-        archive_name = f"{bundle}.tar"  # uncompressed archive
-        subprocess.run(["tar", "-cf", archive_name, "-C", DATASET_DIR, bundle], check=True)
+        archive = f"{bundle}.tar"
+        subprocess.run(["tar", "-cf", archive, "-C", LOCAL, bundle], check=True)
         subprocess.run([
-            "rclone", "copy", archive_name, REMOTE_BASE,
-            "--checksum", "--transfers=32", "--checkers=32", "--fast-list", "--progress"
+            "rclone", "copy", archive, REMOTE,
+            "--checksum", "--transfers=64", "--checkers=64",
+            "--fast-list", "--multi-thread-streams=4", "--progress",
         ], check=True)
-        os.remove(archive_name)
+        os.remove(archive)
         logging.info(f"Processed and uploaded bundle {bundle}")

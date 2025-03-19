@@ -1,4 +1,5 @@
-import os, asyncio, base64, sys, pickle, json, logging
+import os, asyncio, base64, shutil, random, string, logging, sys, requests, glob, cv2, re
+import insightface, torch, pickle, time, bencodepy, hashlib,  json, subprocess, multiprocessing
 from huggingface_hub import login
 from lmdeploy import pipeline, TurbomindEngineConfig
 from lmdeploy.vl import load_image
@@ -27,6 +28,50 @@ Mention any text visible on the character or objects (e.g., logos, patterns, or 
 Specify the lighting’s direction, intensity, and its effect on the character (e.g., shadows or highlights on the body or clothing).
 Indicate the style of the image (e.g., cartoon, photograph, 3D render) and avoid adding subjective interpretations or speculation. Keep the description strictly factual and focus solely on the observable details within the image.
 """
+
+
+
+async def upload_bundle(bundle, local, remote):
+    archive = f"{bundle}.tar"
+    proc = await asyncio.create_subprocess_exec(
+        "tar", "-cf", archive, "-C", local, bundle,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+    proc = await asyncio.create_subprocess_exec(
+        "rclone", "copy", archive, remote,
+        "--checksum", "--transfers=64", "--checkers=64",
+        "--fast-list", "--multi-thread-streams=4", "--progress",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+    os.remove(archive)
+    logging.info(f"Processed and uploaded bundle {bundle}")
+
+
+async def upload_to_drive(stage=0):
+    local = "data/dataset"
+    remote = f"drive:dataset/stage_{stage}"
+    bundles = [d for d in os.listdir(local) if os.path.isdir(os.path.join(local, d)) and d.isdigit()]
+    if bundles:
+        await asyncio.gather(*(upload_bundle(bundle, local, remote) for bundle in bundles))
+
+
+async def fetch(from_stage=0):
+    proc = await asyncio.create_subprocess_exec(
+        "rclone", "copy", f"drive:/dataset/stage_{from_stage}", "data/dataset",
+        "--ignore-existing", "-v",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+    await upload_to_drive(1)
+
+
+async def sync_loop():
+    while True:
+        await fetch(0)
+        await asyncio.sleep(17*60)
+
 
 
 async def process_char_dir(char_dir):
@@ -108,6 +153,7 @@ async def poll_bundles(base):
 
 
 async def main():
+    asyncio.run(sync_loop())
     base_dir = "./data/dataset"
     logging.info("Starting bundle polling.")
     await poll_bundles(base_dir)
