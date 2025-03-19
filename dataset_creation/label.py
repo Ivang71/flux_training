@@ -8,7 +8,8 @@ import nest_asyncio
 nest_asyncio.apply()
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+    filename="label.log", filemode="w")
 
 k = base64.b64decode('aGZfaHZqck9VTXFvTXF3dW9HR3JoTlZKSWlsZUtFTlNQbXRjTw==').decode()
 login(token=k, add_to_git_credential=False)
@@ -31,41 +32,59 @@ Indicate the style of the image (e.g., cartoon, photograph, 3D render) and avoid
 
 
 
+async def extract_archive(archive, local):
+    archive_path = os.path.join(local, archive)
+    proc = await asyncio.create_subprocess_exec(
+        "tar", "--skip-old-files", "-xf", archive_path, "-C", local,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    await proc.communicate()
+    os.remove(archive_path)
+    logging.info(f"Extracted {archive} into {local}")
+
+async def extract_archives(local="data/dataset"):
+    archives = [f for f in os.listdir(local) if f.endswith(".tar")]
+    if archives:
+        await asyncio.gather(*(extract_archive(a, local) for a in archives))
+
 async def upload_bundle(bundle, local, remote):
     archive = f"{bundle}.tar"
     proc = await asyncio.create_subprocess_exec(
         "tar", "-cf", archive, "-C", local, bundle,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
     await proc.communicate()
     proc = await asyncio.create_subprocess_exec(
         "rclone", "copy", archive, remote,
         "--checksum", "--transfers=64", "--checkers=64",
         "--fast-list", "--multi-thread-streams=4", "--progress",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
     await proc.communicate()
     os.remove(archive)
     logging.info(f"Processed and uploaded bundle {bundle}")
 
-
 async def upload_to_drive(stage=0):
     local = "data/dataset"
     remote = f"drive:dataset/stage_{stage}"
-    bundles = [d for d in os.listdir(local) if os.path.isdir(os.path.join(local, d)) and d.isdigit()]
+    bundles = [d for d in os.listdir(local)
+               if os.path.isdir(os.path.join(local, d)) and d.isdigit()]
     if bundles:
-        await asyncio.gather(*(upload_bundle(bundle, local, remote) for bundle in bundles))
-
+        await asyncio.gather(*(upload_bundle(bundle, local, remote)
+                                for bundle in bundles))
 
 async def fetch(from_stage=0):
     proc = await asyncio.create_subprocess_exec(
-        "rclone", "copy", f"drive:/dataset/stage_{from_stage}", "data/dataset",
-        "--ignore-existing", "-v",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    "rclone", "copy", f"drive:/dataset/stage_{from_stage}", "data/dataset", "-v",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
     await proc.communicate()
+    await extract_archives("data/dataset")
     await upload_to_drive(1)
-
 
 async def sync_loop():
     while True:
@@ -138,7 +157,6 @@ async def process_bundle(bundle):
         info["all_labeled"] = True    
     with open(info_path, "w") as f:
         json.dump(info, f, indent=4)
-    logging.info(f"Final bundle info for {bundle}: {info}")
 
 
 
@@ -153,11 +171,11 @@ async def poll_bundles(base):
 
 
 async def main():
-    asyncio.run(sync_loop())
+    sync_task = asyncio.create_task(sync_loop())
     base_dir = "./data/dataset"
     logging.info("Starting bundle polling.")
     await poll_bundles(base_dir)
-
+    sync_task.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
