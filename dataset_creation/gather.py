@@ -1,4 +1,4 @@
-import os, asyncio, base64, shutil, random, string, logging, sys, requests, glob, cv2, re
+import os, asyncio, base64, shutil, random, string, logging, sys, requests, glob, cv2, re, uvloop
 import insightface, torch, pickle, time, bencodepy, hashlib,  json, subprocess, multiprocessing
 from huggingface_hub import login
 from torrentp import TorrentDownloader
@@ -16,6 +16,8 @@ import warnings
 from utils import upload_to_drive
 import nest_asyncio
 nest_asyncio.apply()
+
+# asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 warnings.simplefilter("ignore", FutureWarning)
 
@@ -91,7 +93,7 @@ def get_url(keyword):
         )
         return best['url']
     except Exception as e:
-        logging.info("Error:", e)
+        logging.exception("Error:", e)
         return None
 
 def download_sync(movie_name, save_path):
@@ -153,7 +155,7 @@ def merge_frames(name, parts):
             cnt += 1
         os.rmdir(seg)
 
-async def extract_frames(name, v, parts=8):
+async def extract_frames(name, v, parts=5):
     bd = f"./data/raw_frames/{name}"
     os.makedirs(bd, exist_ok=True)
     total = get_video_duration(v)
@@ -513,7 +515,7 @@ async def main():
         try:
             result = process_movie(movie)
         except Exception as e:
-            logging.info(f"Exception processing {movie}: {e}")
+            logging.exception(f"Exception processing {movie}: {e}")
             result = "something went wrong while processing"
 
         if result == 0:
