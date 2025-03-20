@@ -167,28 +167,6 @@ async def download_extract_frames(movie_name, name, vids_folder):
     return dTime, eTime
 
 
-async def download_and_extract_video(movie_name, name, vids_folder):
-    save_path = f'./data/{name}'
-    t = time.time()
-    await download(movie_name, save_path)
-    dTime = round(time.time() - t, 4)
-    logging.info(f'Downloading took {dTime} seconds')
-    ext = extract_video(save_path, vids_folder, name)
-    logging.info(f'Name: {name}')
-    logging.info(f'Extracted video extension {ext}')
-    vid_path = f"./data/vids/{name + ext}"
-    shutil.rmtree(save_path, ignore_errors=True)
-    return vid_path, dTime
-
-async def extract_frames_from_video(name, vid_path):
-    t = time.time()
-    await extract_frames(name, vid_path)
-    eTime = round(time.time() - t, 4)
-    logging.info(f'Frame extraction took {eTime} seconds')
-    os.remove(vid_path)
-    return eTime
-
-
 # add to dataset
 def get_max_folder_number(directory):
     return max((int(d) for d in os.listdir(directory) if d.isdigit() and isdir(join(directory, d))), default=0)
