@@ -75,7 +75,7 @@ class RateLimiter:
         self.last_call = time.time()
 
 # Create a global rate limiter for YTS API calls
-yts_limiter = RateLimiter(2.0)  # 2 seconds between calls
+yts_limiter = RateLimiter(3.0)  # 3 seconds between calls
 
 def get_url(keyword):
     try:
@@ -106,21 +106,63 @@ def download_sync(movie_name, save_path):
             f.write(requests.get(url).content)
         torrent = TorrentDownloader(torrent_file, save_path)
         asyncio.run(torrent.start_download())
+        
+        # Wait for files to be fully written
+        time.sleep(2)
+        
+        # Verify download location
+        if not os.path.exists(save_path):
+            logging.error(f"Download folder {save_path} was not created")
+            return
+            
+        # Check if any video files exist
+        video_extensions = (".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv")
+        has_video = False
+        for root, _, files in os.walk(save_path):
+            for filename in files:
+                if filename.lower().endswith(video_extensions):
+                    has_video = True
+                    logging.info(f"Found video file: {os.path.join(root, filename)}")
+                    break
+            if has_video:
+                break
+                
+        if not has_video:
+            logging.error(f"No video files found in {save_path} or its subdirectories")
     except Exception as e:
         logging.error(f"Error downloading {movie_name}: {e}")
     finally:
         if os.path.exists(torrent_file):
             os.remove(torrent_file)
 
-async def download(movie_name, save_path, timeout=360):
+async def download(movie_name, save_path, timeout=540):
     proc = multiprocessing.Process(target=download_sync, args=(movie_name, save_path))
     proc.start()
     try:
         await asyncio.wait_for(asyncio.to_thread(proc.join), timeout=timeout)
+        # Verify download completed successfully
+        if not os.path.exists(save_path):
+            logging.error(f"Download folder {save_path} was not created")
+            return False
+        # Check if any video files exist
+        video_extensions = (".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv")
+        has_video = any(
+            filename.lower().endswith(video_extensions)
+            for root, _, files in os.walk(save_path)
+            for filename in files
+        )
+        if not has_video:
+            logging.error(f"No video files found in {save_path}")
+            return False
+        return True
     except asyncio.TimeoutError:
-        logging.info(f"Timeout of {timeout}s reached; aborting download.")
+        logging.error(f"Timeout of {timeout}s reached; aborting download.")
         proc.terminate()
         proc.join()
+        return False
+    except Exception as e:
+        logging.error(f"Error during download: {e}")
+        return False
 
 
 
@@ -128,14 +170,55 @@ def extract_video(source_folder, target_folder, name):
     video_extensions = (".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv")
     os.makedirs(target_folder, exist_ok=True)
 
-    for root, _, files in os.walk(source_folder):
-        for filename in files:
-            if filename.lower().endswith(video_extensions):
-                source_path = os.path.join(root, filename)
-                _, ext = os.path.splitext(filename)
-                destination_path = os.path.join(target_folder, name+ext)
+    # Wait for download to complete and verify folder exists
+    max_retries = 3
+    retry_delay = 2
+    for attempt in range(max_retries):
+        if not os.path.exists(source_folder):
+            logging.warning(f"Source folder {source_folder} not found, attempt {attempt + 1}/{max_retries}")
+            time.sleep(retry_delay)
+            continue
+
+        # List all files in source folder and its subdirectories
+        video_files = []
+        for root, _, files in os.walk(source_folder):
+            for filename in files:
+                if filename.lower().endswith(video_extensions):
+                    video_files.append(os.path.join(root, filename))
+        
+        if not video_files:
+            logging.warning(f"No video files found in {source_folder} or its subdirectories, attempt {attempt + 1}/{max_retries}")
+            time.sleep(retry_delay)
+            continue
+
+        # Try each video file until we successfully move one
+        for source_path in video_files:
+            try:
+                if not os.path.exists(source_path):
+                    logging.warning(f"Video file {source_path} not found, skipping")
+                    continue
+                    
+                _, ext = os.path.splitext(source_path)
+                destination_path = os.path.join(target_folder, name + ext)
+                
+                # Ensure the file is not being written to
+                if os.path.getsize(source_path) == 0:
+                    logging.warning(f"Video file {source_path} is empty, skipping")
+                    continue
+                
                 shutil.move(source_path, destination_path)
-                return ext # Stop after moving the first found video file
+                if not os.path.exists(destination_path):
+                    logging.error(f"Failed to move file to {destination_path}")
+                    continue
+                    
+                logging.info(f"Successfully moved video file from {source_path} to {destination_path}")
+                return ext
+            except Exception as e:
+                logging.error(f"Error moving file {source_path}: {e}")
+                continue
+
+    logging.error(f"Failed to find or move video file after {max_retries} attempts")
+    return None
 
 
 def get_video_duration(v):
@@ -171,24 +254,107 @@ async def extract_frames(name, v, parts=5):
     merge_frames(name, parts)
 
 
+def cleanup_data_folders():
+    data_dir = "./data"
+    if not os.path.exists(data_dir):
+        return
+        
+    allowed_folders = {"dataset", "raw_frames", "vids"}
+    for item in os.listdir(data_dir):
+        item_path = os.path.join(data_dir, item)
+        if os.path.isdir(item_path) and item not in allowed_folders:
+            shutil.rmtree(item_path, ignore_errors=True)
+            logging.info(f"Cleaned up folder: {item_path}")
+
+def cleanup_movie_data(name):
+    """Clean up all temporary files and folders for a specific movie"""
+    paths_to_clean = [
+        f'./data/{name}',  # Download folder
+        f'./data/vids/{name}.mp4',  # Video file
+        f'./data/vids/{name}.mkv',  # Video file
+        f'./data/vids/{name}.avi',  # Video file
+        f'./data/raw_frames/{name}',  # Frames folder
+        f'temp/{name}.torrent'  # Torrent file
+    ]
+    
+    for path in paths_to_clean:
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                logging.info(f"Cleaned up file: {path}")
+            except Exception as e:
+                logging.error(f"Failed to clean up file {path}: {e}")
+        elif os.path.isdir(path):
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                logging.info(f"Cleaned up directory: {path}")
+            except Exception as e:
+                logging.error(f"Failed to clean up directory {path}: {e}")
+
 async def download_frames(movie_name, save_path):
-    t = time.time()
-    await download(movie_name, save_path)
-    dTime = round(time.time() - t, 4)
-    logging.info(f'Downloading took {dTime} seconds')
-    return dTime
+    try:
+        t = time.time()
+        success = await download(movie_name, save_path)
+        if not success:
+            logging.error(f"Download failed for {movie_name}")
+            cleanup_movie_data(os.path.basename(save_path))
+            return None
+            
+        dTime = round(time.time() - t, 4)
+        logging.info(f'Downloading took {dTime} seconds')
+        return dTime
+    except Exception as e:
+        logging.exception(f"Error downloading {movie_name}: {e}")
+        cleanup_movie_data(os.path.basename(save_path))
+        return None
 
 async def extract_frames_from_video(name, vids_folder):
-    save_path = f'./data/{name}'
-    ext = extract_video(save_path, vids_folder, name)
-    vid_path = f"./data/vids/{name + ext}"
-    t = time.time()
-    await extract_frames(name, vid_path)
-    eTime = round(time.time() - t, 4)
-    logging.info(f'Frame extraction took {eTime} seconds')
-    shutil.rmtree(save_path, ignore_errors=True)
-    os.remove(vid_path)
-    return eTime
+    try:
+        save_path = f'./data/{name}'
+        
+        # Verify download folder exists and contains files
+        if not os.path.exists(save_path):
+            logging.error(f"Download folder {save_path} does not exist")
+            cleanup_movie_data(name)
+            return None
+            
+        # List files in download folder
+        files = []
+        for root, _, filenames in os.walk(save_path):
+            files.extend(filenames)
+            
+        if not files:
+            logging.error(f"No files found in download folder {save_path}")
+            cleanup_movie_data(name)
+            return None
+            
+        ext = extract_video(save_path, vids_folder, name)
+        if not ext:
+            logging.error(f"No video file found in {save_path}")
+            cleanup_movie_data(name)
+            return None
+            
+        vid_path = f"./data/vids/{name + ext}"
+        if not os.path.exists(vid_path):
+            logging.error(f"Video file not found at {vid_path}")
+            cleanup_movie_data(name)
+            return None
+            
+        t = time.time()
+        await extract_frames(name, vid_path)
+        eTime = round(time.time() - t, 4)
+        logging.info(f'Frame extraction took {eTime} seconds')
+        return eTime
+    except Exception as e:
+        logging.exception(f"Error extracting frames for {name}: {e}")
+        cleanup_movie_data(name)
+        return None
+    finally:
+        # Clean up temporary files
+        if os.path.exists(save_path):
+            shutil.rmtree(save_path, ignore_errors=True)
+        if 'vid_path' in locals() and os.path.exists(vid_path):
+            os.remove(vid_path)
 
 
 # add to dataset
@@ -392,18 +558,6 @@ async def main():
         await extraction_queue.join()
         await asyncio.gather(*upload_tasks)
 
-
-def cleanup_data_folders():
-    data_dir = "./data"
-    if not os.path.exists(data_dir):
-        return
-        
-    allowed_folders = {"dataset", "raw_frames", "vids"}
-    for item in os.listdir(data_dir):
-        item_path = os.path.join(data_dir, item)
-        if os.path.isdir(item_path) and item not in allowed_folders:
-            shutil.rmtree(item_path, ignore_errors=True)
-            logging.info(f"Cleaned up folder: {item_path}")
 
 if __name__ == '__main__':
     async def runner():
