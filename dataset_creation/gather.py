@@ -389,7 +389,7 @@ async def main():
     upload_tasks = []
     
     # Queue for coordinating downloads and extractions
-    extraction_queue = asyncio.Queue()
+    extraction_queue = asyncio.Queue(maxsize=5)  # Limit queue size to prevent stockpiling
     active_downloads = set()
     max_concurrent_downloads = 5
     
@@ -534,8 +534,13 @@ async def main():
     
     try:
         while movies or active_downloads:
-            # Start new downloads if we have capacity and movies to process
-            while len(active_downloads) < max_concurrent_downloads and movies:
+            # Only start new downloads if:
+            # 1. We have movies to process
+            # 2. We have capacity for new downloads
+            # 3. The extraction queue is not full
+            while (len(active_downloads) < max_concurrent_downloads and 
+                   movies and 
+                   extraction_queue.qsize() < extraction_queue.maxsize):
                 movie = movies.pop(0)
                 name = randStr()
                 os.makedirs('data', exist_ok=True)
@@ -548,6 +553,7 @@ async def main():
                 async def handle_download_completion(task, movie_name, movie_id):
                     try:
                         await task
+                        # Wait for space in the extraction queue
                         await extraction_queue.put((movie_name, movie_id))
                     except Exception as e:
                         logging.exception(f"Download failed for {movie_name}: {e}")
@@ -560,6 +566,10 @@ async def main():
                 # Update movies list
                 with open(movies_path, "w") as f:
                     json.dump(movies, f, indent=4)
+            
+            # Log queue status periodically
+            if movies or active_downloads:
+                logging.info(f"Queue status - Movies remaining: {len(movies)}, Active downloads: {len(active_downloads)}, Extraction queue size: {extraction_queue.qsize()}")
             
             # Wait a bit before checking again
             await asyncio.sleep(1)
