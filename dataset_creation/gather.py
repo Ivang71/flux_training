@@ -290,6 +290,16 @@ def cleanup_movie_data(name):
                 logging.info(f"Cleaned up directory: {path}")
             except Exception as e:
                 logging.error(f"Failed to clean up directory {path}: {e}")
+    
+    # Completely remove and recreate temp folder
+    try:
+        if os.path.exists('temp'):
+            shutil.rmtree('temp', ignore_errors=True)
+            logging.info("Removed temp folder")
+        os.makedirs('temp', exist_ok=True)
+        logging.info("Recreated temp folder")
+    except Exception as e:
+        logging.error(f"Failed to clean up temp folder: {e}")
 
 async def download_frames(movie_name, save_path):
     try:
@@ -396,6 +406,7 @@ async def main():
                         processed.append(movie_name)
                         with open(processed_path, "w") as f:
                             json.dump(processed, f, indent=4)
+                        cleanup_movie_data(name)
                         continue
                     
                     # Continue with the rest of the pipeline
@@ -410,7 +421,7 @@ async def main():
                         processed.append(movie_name)
                         with open(processed_path, "w") as f:
                             json.dump(processed, f, indent=4)
-                        shutil.rmtree(frames_folder, ignore_errors=True)
+                        cleanup_movie_data(name)
                         continue
                         
                     logging.info(f"Collected {len(metadata)} face entries.")
@@ -423,7 +434,7 @@ async def main():
                         processed.append(movie_name)
                         with open(processed_path, "w") as f:
                             json.dump(processed, f, indent=4)
-                        shutil.rmtree(frames_folder, ignore_errors=True)
+                        cleanup_movie_data(name)
                         continue
                         
                     min_size, max_size = 5, 11
@@ -433,7 +444,7 @@ async def main():
                         processed.append(movie_name)
                         with open(processed_path, "w") as f:
                             json.dump(processed, f, indent=4)
-                        shutil.rmtree(frames_folder, ignore_errors=True)
+                        cleanup_movie_data(name)
                         continue
                         
                     clusters = [random.sample(cluster, min(len(cluster), max_size)) for cluster in filtered_clusters]
@@ -512,6 +523,7 @@ async def main():
                     
                 except Exception as e:
                     logging.exception(f"Exception processing {movie_name}: {e}")
+                    cleanup_movie_data(name)
                 finally:
                     extraction_queue.task_done()
             except asyncio.CancelledError:
@@ -539,6 +551,7 @@ async def main():
                         await extraction_queue.put((movie_name, movie_id))
                     except Exception as e:
                         logging.exception(f"Download failed for {movie_name}: {e}")
+                        cleanup_movie_data(movie_id)
                     finally:
                         active_downloads.remove(task)
                 
