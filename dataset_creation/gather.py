@@ -1,4 +1,4 @@
-import os, asyncio, base64, shutil, random, string, logging, sys, requests, glob, cv2, re, uvloop
+import os, asyncio, base64, shutil, random, string, logging, sys, requests, glob, cv2, re
 import insightface, torch, pickle, time, bencodepy, hashlib,  json, subprocess, multiprocessing
 from huggingface_hub import login
 from torrentp import TorrentDownloader
@@ -11,11 +11,9 @@ from utils.face_body_detection import get_frames, cluster_by_char, add_body_data
 # import nest_asyncio
 # nest_asyncio.apply()
 
-# asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
 warnings.simplefilter("ignore", FutureWarning)
 
-k = base64.b64decode('aGZfaHZqck9VTXFvTXF3dW9HR3JoTlZKSWlsZUtFTlNQbXRjTw==').decode()
+k = base64.b64decode('aGZfaHZqck9VTXFvTXF3dW9HR3JoTlZKSWlsZUtFTlNQbXRjTw==').decode() # never change this token
 login(token=k, add_to_git_credential=False)
 os.environ['HUGGINGFACEHUB_API_TOKEN'] = k
 os.environ['HF_TOKEN'] = k
@@ -64,8 +62,24 @@ def randStr(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
 
+class RateLimiter:
+    def __init__(self, min_interval):
+        self.min_interval = min_interval
+        self.last_call = 0
+
+    def wait(self):
+        current_time = time.time()
+        time_since_last = current_time - self.last_call
+        if time_since_last < self.min_interval:
+            time.sleep(self.min_interval - time_since_last)
+        self.last_call = time.time()
+
+# Create a global rate limiter for YTS API calls
+yts_limiter = RateLimiter(2.0)  # 2 seconds between calls
+
 def get_url(keyword):
     try:
+        yts_limiter.wait()  # Wait if needed to respect rate limit
         params = {"query_term": keyword, "sort_by": "peers", "order_by": "desc", "limit": 50}
         r = requests.get("https://yts.mx/api/v2/list_movies.json", params=params)
         r.raise_for_status()
@@ -84,11 +98,19 @@ def download_sync(movie_name, save_path):
     os.makedirs('temp', exist_ok=True)
     torrent_file = f"temp/{re.sub(r'[^a-zA-Z0-9_.-]', '_', movie_name)}.torrent"
     url = get_url(movie_name)
-    with open(torrent_file, "wb") as f:
-        f.write(requests.get(url).content)
-    torrent = TorrentDownloader(torrent_file, save_path)
-    asyncio.run(torrent.start_download())
-    os.remove(torrent_file)
+    if url is None:
+        logging.error(f"Failed to get torrent URL for {movie_name}")
+        return
+    try:
+        with open(torrent_file, "wb") as f:
+            f.write(requests.get(url).content)
+        torrent = TorrentDownloader(torrent_file, save_path)
+        asyncio.run(torrent.start_download())
+    except Exception as e:
+        logging.error(f"Error downloading {movie_name}: {e}")
+    finally:
+        if os.path.exists(torrent_file):
+            os.remove(torrent_file)
 
 async def download(movie_name, save_path, timeout=360):
     proc = multiprocessing.Process(target=download_sync, args=(movie_name, save_path))
@@ -124,7 +146,7 @@ def get_video_duration(v):
 async def extract_segment(name, v, s, d, idx):
     od = f"./data/raw_frames/{name}/segment_{idx}"
     os.makedirs(od, exist_ok=True)
-    cmd = ["ffmpeg", "-hide_banner", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-ss", str(s), "-t", str(d),
+    cmd = ["ffmpeg", "-hide_banner", "-hwaccel", "nvdec", "-hwaccel_output_format", "cuda", "-ss", str(s), "-t", str(d),
            "-i", v, "-vf", "hwdownload,format=nv12,fps=0.5", "-q:v", "2", "-vsync", "0", "-threads", "0", f"{od}/frame_%04d.jpg"]
     proc = await asyncio.create_subprocess_exec(*cmd)
     await proc.wait()
@@ -149,13 +171,15 @@ async def extract_frames(name, v, parts=5):
     merge_frames(name, parts)
 
 
-async def download_extract_frames(movie_name, name, vids_folder):
-    save_path = f'./data/{name}'
+async def download_frames(movie_name, save_path):
     t = time.time()
     await download(movie_name, save_path)
     dTime = round(time.time() - t, 4)
     logging.info(f'Downloading took {dTime} seconds')
-    
+    return dTime
+
+async def extract_frames_from_video(name, vids_folder):
+    save_path = f'./data/{name}'
     ext = extract_video(save_path, vids_folder, name)
     vid_path = f"./data/vids/{name + ext}"
     t = time.time()
@@ -164,107 +188,13 @@ async def download_extract_frames(movie_name, name, vids_folder):
     logging.info(f'Frame extraction took {eTime} seconds')
     shutil.rmtree(save_path, ignore_errors=True)
     os.remove(vid_path)
-    return dTime, eTime
+    return eTime
 
 
 # add to dataset
 def get_max_folder_number(directory):
     return max((int(d) for d in os.listdir(directory) if d.isdigit() and isdir(join(directory, d))), default=0)
 
-
-
-async def process_movie(movie_name):
-    name = randStr()
-    os.makedirs('data', exist_ok=True)
-    vids_folder = "./data/vids"
-
-    try:
-        # Wait up to 12 minutes for the processing to finish.
-        dTime, eTime = await asyncio.wait_for(
-            download_extract_frames(movie_name, name, vids_folder), timeout=12*60
-        )
-    except asyncio.TimeoutError:
-        return "download_extract_frames timeout"
-    t = time.time()
-    frames_folder = f"./data/raw_frames/{name}"
-    logging.info(f"Collecting face entries...")
-    metadata = await asyncio.to_thread(get_frames, frames_folder) # extracting frames with faces
-    fTime = round(time.time() - t, 4)
-    logging.info(f"Collected {len(metadata)} face entries.")
-    logging.info(f'Filtering out frames without faces took {fTime} seconds')
-
-    t = time.time()
-    raw_clusters = await asyncio.to_thread(cluster_by_char, metadata) # clustering by character
-    min_size, max_size = 5, 11
-    filtered_clusters = [cluster for cluster in raw_clusters if len(cluster) >= min_size]
-    clusters = [random.sample(cluster, min(len(cluster), max_size)) for cluster in filtered_clusters]
-    for i, c in enumerate(clusters):
-        logging.info(f"Cluster {i} has {len(c)} frames.")
-    cTime = round(time.time() - t, 4)
-    logging.info(f'Clustering took {cTime} seconds')
-
-    t = time.time()
-    for i, cluster in enumerate(clusters): # adding body bounding box and body embedding
-        for idx in tqdm(cluster, desc=f"Cluster {i}"):
-            result = await asyncio.to_thread(add_body_data, metadata[idx])
-            if result is None:
-                metadata[idx]["defective"] = True
-            else:
-                metadata[idx] = result
-    bTime = round(time.time() - t, 4)
-    logging.info(f'Processing bodies took {bTime} seconds')
-
-    t = time.time()
-    base = join(os.getcwd(), 'data', 'dataset') # add to dataset
-    os.makedirs(base, exist_ok=True)
-    bundle = get_max_folder_number(base)
-    os.makedirs(join(base, str(bundle)), exist_ok=True)
-    char = get_max_folder_number(join(base, str(bundle)))
-
-    for cluster in clusters:
-        if char > 999:
-            bundle += 1
-            char = 0
-            new_folder = join(base, str(bundle))
-            os.makedirs(new_folder, exist_ok=True)
-            with open(join(new_folder, "info.json"), "w") as f:
-                json.dump({"all_labeled": False, "labeled": []}, f)
-
-        char_dir = join(base, str(bundle), str(char))
-        os.makedirs(char_dir, exist_ok=True)
-
-        char_data = []
-        img_index = 0
-
-        for mtd_i in cluster:
-            if metadata[mtd_i].get('defective', False):
-                continue
-
-            src_path = metadata[mtd_i]['image_path']
-            dest_image_name = f'{img_index}.jpg'
-            dest_path = join(char_dir, dest_image_name)
-
-            shutil.copy2(src_path, dest_path)
-
-            frame_copy = deepcopy(metadata[mtd_i])
-            frame_copy['image_path'] = dest_path
-            char_data.append(frame_copy)
-            img_index += 1
-
-        with open(join(char_dir, 'char_data.pkl'), 'wb') as f:
-            pickle.dump(char_data, f)
-        char += 1
-    aTime = round(time.time() - t, 4)
-
-    shutil.rmtree(frames_folder, ignore_errors=True)
-    logging.info(f"Downloading took {dTime} seconds")
-    logging.info(f"Extraction took {eTime} seconds")
-    logging.info(f"Filtering took {fTime} seconds")
-    logging.info(f"Clustering took {cTime} seconds")
-    logging.info(f"Body processing took {bTime} seconds")
-    logging.info(f'Adding to dataset took {aTime} seconds')
-
-    return 0
 
 
 async def main():
@@ -282,39 +212,202 @@ async def main():
     
     upload_tasks = []
     
-    while movies:
-        movie = movies.pop(0)
-        try:
-            result = await process_movie(movie)
-        except Exception as e:
-            logging.exception(f"Exception processing {movie}: {e}")
-            result = "something went wrong while processing"
-
-        if result == 0:
-            logging.info(f"Successfully processed {movie}")
-            processed.append(movie)
-        else:
-            logging.exception(f"Processing error ({result}) for {movie}")
-        
-        with open(movies_path, "w") as f:
-            json.dump(movies, f, indent=4)
-        with open(processed_path, "w") as f:
-            json.dump(processed, f, indent=4)
-        
-        # Launch the upload function in the background asynchronously.
-        # This runs upload_to_drive(0) in a separate thread.
-        task = asyncio.create_task(asyncio.to_thread(upload_to_drive, 0))
-        upload_tasks.append(task)
-        
-        # Optionally yield control so upload can start concurrently.
-        await asyncio.sleep(0)
+    # Queue for coordinating downloads and extractions
+    extraction_queue = asyncio.Queue()
+    active_downloads = set()
+    max_concurrent_downloads = 5
     
-    # Wait for all upload tasks to finish before exiting.
-    await asyncio.gather(*upload_tasks)
+    async def process_extraction_queue():
+        while True:
+            try:
+                # Get next movie to extract frames from
+                movie_name, name = await extraction_queue.get()
+                try:
+                    # Extract frames (this runs sequentially)
+                    eTime = await extract_frames_from_video(name, "./data/vids")
+                    if eTime is None:
+                        logging.error(f"Failed to extract frames for {movie_name}")
+                        processed.append(movie_name)
+                        with open(processed_path, "w") as f:
+                            json.dump(processed, f, indent=4)
+                        continue
+                    
+                    # Continue with the rest of the pipeline
+                    frames_folder = f"./data/raw_frames/{name}"
+                    logging.info(f"Collecting face entries...")
+                    t = time.time()  # Initialize time before using it
+                    metadata = await asyncio.to_thread(get_frames, frames_folder)
+                    fTime = round(time.time() - t, 4)
+                    
+                    if not metadata:
+                        logging.error(f"No faces detected in frames for {movie_name}")
+                        processed.append(movie_name)
+                        with open(processed_path, "w") as f:
+                            json.dump(processed, f, indent=4)
+                        shutil.rmtree(frames_folder, ignore_errors=True)
+                        continue
+                        
+                    logging.info(f"Collected {len(metadata)} face entries.")
+                    logging.info(f'Filtering out frames without faces took {fTime} seconds')
 
+                    t = time.time()
+                    raw_clusters = await asyncio.to_thread(cluster_by_char, metadata)
+                    if not raw_clusters:
+                        logging.error(f"No valid clusters found for {movie_name}")
+                        processed.append(movie_name)
+                        with open(processed_path, "w") as f:
+                            json.dump(processed, f, indent=4)
+                        shutil.rmtree(frames_folder, ignore_errors=True)
+                        continue
+                        
+                    min_size, max_size = 5, 11
+                    filtered_clusters = [cluster for cluster in raw_clusters if len(cluster) >= min_size]
+                    if not filtered_clusters:
+                        logging.error(f"No clusters meet minimum size requirement for {movie_name}")
+                        processed.append(movie_name)
+                        with open(processed_path, "w") as f:
+                            json.dump(processed, f, indent=4)
+                        shutil.rmtree(frames_folder, ignore_errors=True)
+                        continue
+                        
+                    clusters = [random.sample(cluster, min(len(cluster), max_size)) for cluster in filtered_clusters]
+                    for i, c in enumerate(clusters):
+                        logging.info(f"Cluster {i} has {len(c)} frames.")
+                    cTime = round(time.time() - t, 4)
+                    logging.info(f'Clustering took {cTime} seconds')
+
+                    t = time.time()
+                    for i, cluster in enumerate(clusters):
+                        for idx in tqdm(cluster, desc=f"Cluster {i}"):
+                            result = await asyncio.to_thread(add_body_data, metadata[idx])
+                            if result is None:
+                                metadata[idx]["defective"] = True
+                            else:
+                                metadata[idx] = result
+                    bTime = round(time.time() - t, 4)
+                    logging.info(f'Processing bodies took {bTime} seconds')
+
+                    t = time.time()
+                    base = join(os.getcwd(), 'data', 'dataset')
+                    os.makedirs(base, exist_ok=True)
+                    bundle = get_max_folder_number(base)
+                    os.makedirs(join(base, str(bundle)), exist_ok=True)
+                    char = get_max_folder_number(join(base, str(bundle)))
+
+                    for cluster in clusters:
+                        if char > 999:
+                            bundle += 1
+                            char = 0
+                            new_folder = join(base, str(bundle))
+                            os.makedirs(new_folder, exist_ok=True)
+                            with open(join(new_folder, "info.json"), "w") as f:
+                                json.dump({"all_labeled": False, "labeled": []}, f)
+
+                        char_dir = join(base, str(bundle), str(char))
+                        os.makedirs(char_dir, exist_ok=True)
+
+                        char_data = []
+                        img_index = 0
+
+                        for mtd_i in cluster:
+                            if metadata[mtd_i].get('defective', False):
+                                continue
+
+                            src_path = metadata[mtd_i]['image_path']
+                            dest_image_name = f'{img_index}.jpg'
+                            dest_path = join(char_dir, dest_image_name)
+
+                            shutil.copy2(src_path, dest_path)
+
+                            frame_copy = deepcopy(metadata[mtd_i])
+                            frame_copy['image_path'] = dest_path
+                            char_data.append(frame_copy)
+                            img_index += 1
+
+                        with open(join(char_dir, 'char_data.pkl'), 'wb') as f:
+                            pickle.dump(char_data, f)
+                        char += 1
+                    aTime = round(time.time() - t, 4)
+
+                    shutil.rmtree(frames_folder, ignore_errors=True)
+                    logging.info(f"Extraction took {eTime} seconds")
+                    logging.info(f"Filtering took {fTime} seconds")
+                    logging.info(f"Clustering took {cTime} seconds")
+                    logging.info(f"Body processing took {bTime} seconds")
+                    logging.info(f'Adding to dataset took {aTime} seconds')
+
+                    processed.append(movie_name)
+                    with open(processed_path, "w") as f:
+                        json.dump(processed, f, indent=4)
+                    
+                    # Launch upload in background
+                    task = asyncio.create_task(asyncio.to_thread(upload_to_drive, 0))
+                    upload_tasks.append(task)
+                    
+                except Exception as e:
+                    logging.exception(f"Exception processing {movie_name}: {e}")
+                finally:
+                    extraction_queue.task_done()
+            except asyncio.CancelledError:
+                break
+
+    # Start the extraction queue processor
+    extraction_processor = asyncio.create_task(process_extraction_queue())
+    
+    try:
+        while movies or active_downloads:
+            # Start new downloads if we have capacity and movies to process
+            while len(active_downloads) < max_concurrent_downloads and movies:
+                movie = movies.pop(0)
+                name = randStr()
+                os.makedirs('data', exist_ok=True)
+                
+                # Create download task
+                download_task = asyncio.create_task(download_frames(movie, f'./data/{name}'))
+                active_downloads.add(download_task)
+                
+                # When download completes, add to extraction queue
+                async def handle_download_completion(task, movie_name, movie_id):
+                    try:
+                        await task
+                        await extraction_queue.put((movie_name, movie_id))
+                    except Exception as e:
+                        logging.exception(f"Download failed for {movie_name}: {e}")
+                    finally:
+                        active_downloads.remove(task)
+                
+                asyncio.create_task(handle_download_completion(download_task, movie, name))
+                
+                # Update movies list
+                with open(movies_path, "w") as f:
+                    json.dump(movies, f, indent=4)
+            
+            # Wait a bit before checking again
+            await asyncio.sleep(1)
+    
+    finally:
+        # Clean up
+        extraction_processor.cancel()
+        await extraction_processor
+        await extraction_queue.join()
+        await asyncio.gather(*upload_tasks)
+
+
+def cleanup_data_folders():
+    data_dir = "./data"
+    if not os.path.exists(data_dir):
+        return
+        
+    allowed_folders = {"dataset", "raw_frames", "vids"}
+    for item in os.listdir(data_dir):
+        item_path = os.path.join(data_dir, item)
+        if os.path.isdir(item_path) and item not in allowed_folders:
+            shutil.rmtree(item_path, ignore_errors=True)
+            logging.info(f"Cleaned up folder: {item_path}")
 
 if __name__ == '__main__':
     async def runner():
+        cleanup_data_folders()  # Clean up before starting
         sync_task = asyncio.create_task(sync_loop())
         result = await main()
         sync_task.cancel()
