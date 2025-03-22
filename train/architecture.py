@@ -10,13 +10,16 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import time
 
+from diffusers import FluxPipeline
+
 class PerceiverResampler(nn.Module):
     """
     Perceiver Resampler module that transforms variable-length input embeddings 
     into a fixed number of latent tokens.
     """
-    def __init__(self, input_dim: int, latent_dim: int, num_latents: int, num_layers: int = 4, num_heads: int = 8):
+    def __init__(self, input_dim: int, latent_dim: int, num_latents: int, num_layers: int = 4, num_heads: int = 8, device: str = "cuda"):
         super().__init__()
+        self.device = device
         self.latents = nn.Parameter(torch.randn(num_latents, latent_dim) * 0.02)
         
         self.input_proj = nn.Linear(input_dim, latent_dim)
@@ -63,6 +66,9 @@ class IdentityInjectionLayer(nn.Module):
     """
     def __init__(self, feature_dim: int, identity_dim: int, num_heads: int = 8):
         super().__init__()
+        self.feature_dim = feature_dim
+        self.identity_dim = identity_dim
+        
         self.norm1 = nn.LayerNorm(feature_dim)
         self.norm2 = nn.LayerNorm(feature_dim)
         
@@ -84,29 +90,98 @@ class IdentityInjectionLayer(nn.Module):
         self.last_attention_map = None
     
     def forward(self, hidden_states: torch.Tensor, identity_tokens: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
+        # Store original shape for later reshape
+        original_shape = hidden_states.shape
+        original_dtype = hidden_states.dtype
+        
+        # Print shape information for debugging
+        print(f"Hidden states shape: {hidden_states.shape}, Identity tokens shape: {identity_tokens.shape}")
+        print(f"Hidden states dtype: {hidden_states.dtype}, Identity tokens dtype: {identity_tokens.dtype}")
+        
+        # Adapt the hidden states to the expected format [B, seq_len, dim]
+        if len(original_shape) == 4:  # [B, C, H, W]
+            B, C, H, W = original_shape
+            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(B, H*W, C)
+        elif len(original_shape) == 3 and original_shape[2] != self.feature_dim:
+            # If the last dimension doesn't match feature_dim, reshape is needed
+            B, seq_len, C = original_shape
+            # Use reshape or projection based on dimensions
+            if C % self.feature_dim == 0:
+                # Reshape to merge dimensions
+                factor = C // self.feature_dim
+                hidden_states = hidden_states.reshape(B, seq_len * factor, self.feature_dim)
+            else:
+                # Project to the correct dimension using a dynamic projection
+                print(f"Creating dynamic projection from {C} to {self.feature_dim}")
+                projection = nn.Linear(C, self.feature_dim).to(hidden_states.device)
+                hidden_states = projection(hidden_states)
+                
+        # Convert to the same dtype if needed
+        if hidden_states.dtype != identity_tokens.dtype:
+            identity_tokens = identity_tokens.to(dtype=hidden_states.dtype)
+        
         # Project identity tokens if dimensions don't match
-        if identity_tokens.shape[-1] != hidden_states.shape[-1]:
+        if identity_tokens.shape[-1] != self.feature_dim:
             identity_tokens = self.identity_proj(identity_tokens)
         
-        # First attention block
-        norm_hidden = self.norm1(hidden_states)
-        attn_output, attn_weights = self.attn(
-            query=norm_hidden,
-            key=identity_tokens,
-            value=identity_tokens
-        )
+        # First run the layer norm on hidden states
+        try:
+            norm_hidden = self.norm1(hidden_states)
+        except Exception as e:
+            print(f"Error in norm1: {e}")
+            print(f"Using custom normalization due to dimension mismatch")
+            # Apply a custom normalization as fallback
+            norm_hidden = F.layer_norm(
+                hidden_states, 
+                normalized_shape=[hidden_states.shape[-1]], 
+                weight=None, 
+                bias=None
+            )
         
-        # Store attention map for visualization
-        self.last_attention_map = attn_weights
-        
-        # Apply identity strength control
-        hidden_states = hidden_states + (attn_output * strength)
+        # Attention block
+        try:
+            attn_output, attn_weights = self.attn(
+                query=norm_hidden,
+                key=identity_tokens,
+                value=identity_tokens
+            )
+            
+            # Store attention map for visualization
+            self.last_attention_map = attn_weights
+            
+            # Apply identity strength control
+            hidden_states = hidden_states + (attn_output * strength)
+        except Exception as e:
+            print(f"Error in attention: {e}")
+            print("Skipping attention due to dimension mismatch")
+            # Return original hidden states if attention fails
+            return hidden_states
         
         # Feed-forward block
-        norm_hidden = self.norm2(hidden_states)
-        ff_output = self.ff(norm_hidden)
-        hidden_states = hidden_states + ff_output
+        try:
+            norm_hidden = self.norm2(hidden_states)
+            ff_output = self.ff(norm_hidden)
+            hidden_states = hidden_states + ff_output
+        except Exception as e:
+            print(f"Error in feed-forward: {e}")
+            print("Skipping feed-forward due to dimension mismatch")
         
+        # Reshape back to the original dimensions if needed
+        if len(original_shape) == 4:  # [B, C, H, W]
+            B, HW, C = hidden_states.shape
+            H = W = int(np.sqrt(HW))
+            hidden_states = hidden_states.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        elif len(original_shape) == 3 and original_shape[2] != self.feature_dim:
+            # Try to reshape back to original dimensions
+            B, seq_len_new, C_new = hidden_states.shape
+            if original_shape[2] % C_new == 0:
+                factor = original_shape[2] // C_new
+                hidden_states = hidden_states.reshape(B, original_shape[1], original_shape[2])
+            
+        # Convert back to original dtype if needed
+        if hidden_states.dtype != original_dtype:
+            hidden_states = hidden_states.to(dtype=original_dtype)
+            
         return hidden_states
 
 
@@ -174,14 +249,14 @@ class FaceIdentityExtractor(nn.Module):
     
     def forward(self, img: np.ndarray) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
         """
-        Extract face embeddings from a batch of images.
+        Extract face embedding from an image (only the primary/largest face).
         
         Args:
             img: np.ndarray of shape [H, W, C] in RGB format
         
         Returns:
-            face_embeddings: torch.Tensor of shape [1, num_faces, 512]
-            face_metadata: List of face information dictionaries
+            face_embedding: torch.Tensor of shape [1, 1, 512] (single face)
+            face_metadata: List with single face information dictionary or empty list
         """
         faces = self.face_analyzer.get(img)
         
@@ -192,23 +267,21 @@ class FaceIdentityExtractor(nn.Module):
         # Sort faces by area (largest first)
         faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
         
-        # Get embeddings for all detected faces
-        embeddings = [torch.tensor(face.embedding).unsqueeze(0) for face in faces]
-        face_embeddings = torch.cat(embeddings, dim=0).unsqueeze(0)  # [1, num_faces, 512]
+        # Get embedding only for the largest face
+        primary_face = faces[0]
+        face_embedding = torch.tensor(primary_face.embedding).unsqueeze(0).unsqueeze(0)  # [1, 1, 512]
         
-        # Prepare face metadata
-        metadata = []
-        for face in faces:
-            metadata.append({
-                "bbox": face.bbox,
-                "kps": face.kps,
-                "det_score": face.det_score,
-                "landmark_3d_68": getattr(face, "landmark_3d_68", None),
-                "gender": getattr(face, "gender", None),
-                "age": getattr(face, "age", None)
-            })
+        # Prepare face metadata for the primary face
+        metadata = [{
+            "bbox": primary_face.bbox,
+            "kps": primary_face.kps,
+            "det_score": primary_face.det_score,
+            "landmark_3d_68": getattr(primary_face, "landmark_3d_68", None),
+            "gender": getattr(primary_face, "gender", None),
+            "age": getattr(primary_face, "age", None)
+        }]
         
-        return face_embeddings, metadata
+        return face_embedding, metadata
 
 
 class YOLOBodyDetector(nn.Module):
@@ -353,14 +426,14 @@ class BodyIdentityExtractor(nn.Module):
     
     def forward(self, img: np.ndarray) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
-        Extract body embeddings from an image.
+        Extract body embedding from an image (only the primary/largest person).
         
         Args:
             img: np.ndarray of shape [H, W, C] in RGB format
             
         Returns:
-            body_embeddings: torch.Tensor of shape [1, num_persons, 1024]
-            boxes: List of tensors containing [x1, y1, x2, y2, score]
+            body_embedding: torch.Tensor of shape [1, 1, 1024] (single person)
+            body_box: List with single tensor containing [x1, y1, x2, y2, score] or empty list
         """
         start_time = time.time()
         
@@ -374,19 +447,18 @@ class BodyIdentityExtractor(nn.Module):
             # Return empty embedding if no person detected
             return torch.zeros(1, 1, 1024), []
         
-        # Extract features for each person
-        embeddings = []
-        for box in boxes:
-            features = self.extract_features(img, box)
-            embeddings.append(features)
+        # Sort boxes by area (largest first) if there are multiple detections
+        if len(boxes) > 1:
+            boxes.sort(key=lambda box: (box[2] - box[0]) * (box[3] - box[1]), reverse=True)
+        
+        # Extract features only for the largest person
+        primary_box = boxes[0]
+        body_embedding = self.extract_features(img, primary_box).unsqueeze(0)  # [1, 1, 1024]
         
         feature_time = time.time()
         print(f"Feature extraction took: {feature_time - detect_time:.2f}s")
         
-        # Combine embeddings
-        body_embeddings = torch.cat(embeddings, dim=0).unsqueeze(0)  # [1, num_persons, 1024]
-        
-        return body_embeddings, boxes
+        return body_embedding, [primary_box]
 
 
 class IdentityPreservingFlux(nn.Module):
@@ -488,12 +560,32 @@ class IdentityPreservingFlux(nn.Module):
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
-        if idx < 19:  # DoubleStream blocks (N=19)
-            return self.base_model.double_stream_blocks[idx]
-        elif idx < 57:  # SingleStream blocks (M=38)
-            return self.base_model.single_stream_blocks[idx - 19]
-        else:
-            raise ValueError(f"Index {idx} out of range for Flux.1 architecture")
+        # Access blocks directly from the model's layers for compatibility
+        # with different versions of the Flux model
+        try:
+            # For newer versions of Flux using transformer blocks
+            if hasattr(self.base_model, 'transformer_blocks'):
+                return self.base_model.transformer_blocks[idx]
+            # For versions with separate double_stream and single_stream blocks
+            elif hasattr(self.base_model, 'double_stream_blocks') and idx < 19:
+                return self.base_model.double_stream_blocks[idx]
+            elif hasattr(self.base_model, 'single_stream_blocks') and idx >= 19 and idx < 57:
+                return self.base_model.single_stream_blocks[idx - 19]
+            # For models with a flat list of blocks
+            elif hasattr(self.base_model, 'blocks'):
+                return self.base_model.blocks[idx]
+            # For models with layers attribute
+            elif hasattr(self.base_model, 'layers'):
+                return self.base_model.layers[idx]
+            else:
+                print(f"WARNING: Could not find appropriate blocks in the model structure.")
+                print(f"Available attributes: {dir(self.base_model)}")
+                # Return the model itself as fallback
+                return self.base_model
+        except (IndexError, AttributeError) as e:
+            print(f"Error accessing model layer at index {idx}: {e}")
+            print(f"Model structure may have changed. Available attributes: {dir(self.base_model)}")
+            return self.base_model
     
     def _register_hooks(self):
         """Register forward hooks in the base model to inject identity information"""
@@ -503,79 +595,98 @@ class IdentityPreservingFlux(nn.Module):
         # Unregister existing hooks if any
         self._unregister_hooks()
         
-        # Register face injection hook
-        face_module = self._get_flux_module_by_index(self.face_injection_index)
-        
+        # Try to retrieve the modules for face and body injection
+        try:
+            face_module = self._get_flux_module_by_index(self.face_injection_index)
+            body_module = self._get_flux_module_by_index(self.body_injection_index)
+            
+            print(f"Successfully located face injection module: {type(face_module).__name__}")
+            print(f"Successfully located body injection module: {type(body_module).__name__}")
+        except Exception as e:
+            print(f"Error finding modules for hooks: {e}")
+            print("Attempting alternate hook registration...")
+            
+            # Fallback: Register hooks on the entire model
+            face_module = self.base_model
+            body_module = self.base_model
+            print("Using the entire model for hooks (fallback)")
+            
+        # Define face hook
         def face_hook(module, input_tensors, output):
-            # Get the tensors in the format needed
-            hidden_states = output
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[0]
+            try:
+                # Get the tensors in the format needed
+                hidden_states = output
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
                 
-            # Ensure hidden states are in the right format [B, seq_len, hidden_dim]
-            if hidden_states.dim() == 4:  # [B, C, H, W]
-                B, C, H, W = hidden_states.shape
-                hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(B, H*W, C)
-            
-            # Apply identity injection
-            if hasattr(self, 'current_face_tokens'):
-                hidden_states = self.face_injection(
-                    hidden_states, 
-                    self.current_face_tokens,
-                    strength=self.face_strength
-                )
-                
-                # Reshape back if needed
-                if output.dim() == 4:
-                    B, HW, C = hidden_states.shape
-                    H = W = int(np.sqrt(HW))
-                    hidden_states = hidden_states.reshape(B, H, W, C).permute(0, 3, 1, 2)
+                # Skip if we don't have face tokens
+                if not hasattr(self, 'current_face_tokens'):
+                    return output
                     
-                if isinstance(output, tuple):
-                    return (hidden_states,) + output[1:]
-                else:
-                    return hidden_states
+                # Apply identity injection with error handling
+                try:
+                    hidden_states = self.face_injection(
+                        hidden_states, 
+                        self.current_face_tokens,
+                        strength=self.face_strength
+                    )
+                    
+                    # Reshape result to match output format
+                    if isinstance(output, tuple):
+                        return (hidden_states,) + output[1:]
+                    else:
+                        return hidden_states
+                except Exception as e:
+                    print(f"Error in face injection: {e}")
+                    # On error, return original output
+                    return output
+            except Exception as e:
+                print(f"Error in face hook: {e}")
+                # On any error, return original output
+                return output
             
-            return output
-            
-        # Register body injection hook
-        body_module = self._get_flux_module_by_index(self.body_injection_index)
-        
+        # Define body hook
         def body_hook(module, input_tensors, output):
-            # Get the tensors in the format needed
-            hidden_states = output
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[0]
+            try:
+                # Get the tensors in the format needed
+                hidden_states = output
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
                 
-            # Ensure hidden states are in the right format [B, seq_len, hidden_dim]
-            if hidden_states.dim() == 4:  # [B, C, H, W]
-                B, C, H, W = hidden_states.shape
-                hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(B, H*W, C)
-            
-            # Apply identity injection
-            if hasattr(self, 'current_body_tokens'):
-                hidden_states = self.body_injection(
-                    hidden_states, 
-                    self.current_body_tokens,
-                    strength=self.body_strength
-                )
+                # Skip if we don't have body tokens
+                if not hasattr(self, 'current_body_tokens'):
+                    return output
                 
-                # Reshape back if needed
-                if output.dim() == 4:
-                    B, HW, C = hidden_states.shape
-                    H = W = int(np.sqrt(HW))
-                    hidden_states = hidden_states.reshape(B, H, W, C).permute(0, 3, 1, 2)
+                # Apply identity injection with error handling
+                try:
+                    hidden_states = self.body_injection(
+                        hidden_states, 
+                        self.current_body_tokens,
+                        strength=self.body_strength
+                    )
                     
-                if isinstance(output, tuple):
-                    return (hidden_states,) + output[1:]
-                else:
-                    return hidden_states
-            
-            return output
+                    # Reshape result to match output format
+                    if isinstance(output, tuple):
+                        return (hidden_states,) + output[1:]
+                    else:
+                        return hidden_states
+                except Exception as e:
+                    print(f"Error in body injection: {e}")
+                    # On error, return original output
+                    return output
+            except Exception as e:
+                print(f"Error in body hook: {e}")
+                # On any error, return original output
+                return output
         
         # Register the hooks
-        self.hooks['face'] = face_module.register_forward_hook(face_hook)
-        self.hooks['body'] = body_module.register_forward_hook(body_hook)
+        try:
+            self.hooks['face'] = face_module.register_forward_hook(face_hook)
+            self.hooks['body'] = body_module.register_forward_hook(body_hook)
+            print("Successfully registered identity injection hooks")
+        except Exception as e:
+            print(f"Failed to register hooks: {e}")
+            print("Identity injection may not work properly")
     
     def _unregister_hooks(self):
         """Unregister all hooks"""
@@ -583,6 +694,64 @@ class IdentityPreservingFlux(nn.Module):
             hook.remove()
         self.hooks = {}
     
+    def _scan_model_structure(self):
+        """Scan the model structure to identify appropriate injection points"""
+        if self.base_model is None:
+            raise ValueError("Base model not loaded. Call load_base_model first.")
+            
+        print("\nScanning Flux model structure...")
+        
+        # Check for specific Flux model architecture components
+        if hasattr(self.base_model, 'transformer_blocks'):
+            blocks = self.base_model.transformer_blocks
+            print(f"Found transformer_blocks: {len(blocks)} blocks")
+            # Use appropriate indices for different points in the model
+            total_blocks = len(blocks)
+            self.face_injection_index = int(total_blocks * 0.9)  # Face near the end (90%)
+            self.body_injection_index = int(total_blocks * 0.5)  # Body in the middle (50%)
+            print(f"Set face_injection_index={self.face_injection_index}, body_injection_index={self.body_injection_index}")
+            return True
+            
+        elif hasattr(self.base_model, 'blocks'):
+            blocks = self.base_model.blocks
+            print(f"Found blocks: {len(blocks)} blocks")
+            total_blocks = len(blocks)
+            self.face_injection_index = int(total_blocks * 0.9)
+            self.body_injection_index = int(total_blocks * 0.5)
+            print(f"Set face_injection_index={self.face_injection_index}, body_injection_index={self.body_injection_index}")
+            return True
+            
+        elif hasattr(self.base_model, 'layers'):
+            layers = self.base_model.layers
+            print(f"Found layers: {len(layers)} layers")
+            total_layers = len(layers)
+            self.face_injection_index = int(total_layers * 0.9)
+            self.body_injection_index = int(total_layers * 0.5)
+            print(f"Set face_injection_index={self.face_injection_index}, body_injection_index={self.body_injection_index}")
+            return True
+            
+        # If we have separate streams (original architecture)
+        found_structure = False
+        if hasattr(self.base_model, 'double_stream_blocks'):
+            double_blocks = self.base_model.double_stream_blocks
+            print(f"Found double_stream_blocks: {len(double_blocks)} blocks")
+            found_structure = True
+            
+        if hasattr(self.base_model, 'single_stream_blocks'):
+            single_blocks = self.base_model.single_stream_blocks
+            print(f"Found single_stream_blocks: {len(single_blocks)} blocks")
+            found_structure = True
+            
+        if found_structure:
+            print(f"Original architecture detected. Using face_injection_index={self.face_injection_index}, body_injection_index={self.body_injection_index}")
+            return True
+            
+        # If we couldn't identify the structure
+        print("WARNING: Could not identify model structure.")
+        print(f"Model attributes: {dir(self.base_model)}")
+        print("Using default injection indices, but hooks may not work properly.")
+        return False
+        
     def load_base_model(self, base_model=None):
         """
         Load the base Flux model or use provided model.
@@ -595,22 +764,34 @@ class IdentityPreservingFlux(nn.Module):
         """
         if base_model is not None:
             self.base_model = base_model
+            # Scan model structure to determine injection points
+            self._scan_model_structure()
+            # Register hooks based on the determined structure
             self._register_hooks()
             return self.base_model
             
         try:
-            from diffusers import FluxModel
             print(f"Loading Flux model with torch_dtype={self.torch_dtype}")
-            model = FluxModel.from_pretrained(
+            
+            # Use FluxPipeline for proper loading
+            pipe = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
-                torch_dtype=self.torch_dtype,
-                device_map=self.device_map
-            )
-            self.base_model = model
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            ).to("cuda" if torch.cuda.is_available() else "cpu")
+            
+            # Extract the transformer model
+            self.base_model = pipe.transformer
+            # Scan model structure to determine injection points
+            self._scan_model_structure()
+            # Register hooks based on the determined structure
             self._register_hooks()
-            return model
+            
+            # Store the pipeline for future use
+            self.pipeline = pipe
+            
+            return self.base_model
         except ImportError as e:
-            print(f"Could not import FluxModel from diffusers: {e}")
+            print(f"Could not import FluxPipeline from diffusers: {e}")
             print("Make sure you have the latest version installed.")
             print("Continuing with model structure tests only.")
             return None
@@ -627,10 +808,10 @@ class IdentityPreservingFlux(nn.Module):
             image: Either a PIL Image, numpy array, or path to an image file
             
         Returns:
-            face_embeddings: torch.Tensor of shape [1, num_faces, 512]
-            body_embeddings: torch.Tensor of shape [1, num_persons, 1024]
-            face_metadata: List of face information dictionaries
-            body_boxes: List of tensors containing [x1, y1, x2, y2, score]
+            face_embedding: torch.Tensor of shape [1, 1, 512] (single face)
+            body_embedding: torch.Tensor of shape [1, 1, 1024] (single body)
+            face_metadata: Dictionary of face information for the primary face
+            body_box: Tensor containing [x1, y1, x2, y2, score] for the primary body
         """
         # Convert image to numpy array if needed
         if isinstance(image, str):
@@ -645,60 +826,61 @@ class IdentityPreservingFlux(nn.Module):
         # Extract body embeddings
         body_embeddings, body_boxes = self.body_extractor(image)
         
-        return face_embeddings, body_embeddings, face_metadata, body_boxes
+        # Take only the first/primary face embedding
+        # If no faces detected, face_embeddings will already be a zero tensor of shape [1, 1, 512]
+        face_embedding = face_embeddings[:, 0:1, :] if face_embeddings.size(1) > 0 else face_embeddings
+        
+        # Take only the primary face metadata or empty dict if none found
+        primary_face_metadata = face_metadata[0] if face_metadata else {}
+        
+        # Take only the first/primary body embedding
+        # If no bodies detected, body_embeddings will already be a zero tensor of shape [1, 1, 1024]
+        body_embedding = body_embeddings[:, 0:1, :] if body_embeddings.size(1) > 0 else body_embeddings
+        
+        # Take only the primary body box or None if none found
+        primary_body_box = body_boxes[0] if body_boxes else None
+        
+        return face_embedding, body_embedding, primary_face_metadata, primary_body_box
     
-    def prepare_identity_tokens(self, face_embeddings=None, body_embeddings=None):
+    def prepare_identity_tokens(self, face_embedding=None, body_embedding=None):
         """
         Prepare identity tokens from face and body embeddings.
         
         Args:
-            face_embeddings: Tensor of shape [batch_size, num_faces, face_dim]
-            body_embeddings: Tensor of shape [batch_size, num_persons, body_dim]
+            face_embedding: Tensor of shape [batch_size, 1, face_dim] (single face)
+            body_embedding: Tensor of shape [batch_size, 1, body_dim] (single body)
         """
         face_tokens = None
         body_tokens = None
         batch_size = 1  # Default batch size
         
-        # Process face embeddings if provided
-        if face_embeddings is not None and face_embeddings.ndim == 3:
-            batch_size = face_embeddings.shape[0]
-            face_tokens = self.face_perceiver(face_embeddings)
+        # Process face embedding if provided
+        if face_embedding is not None and face_embedding.ndim == 3:
+            batch_size = face_embedding.shape[0]
+            face_tokens = self.face_perceiver(face_embedding)
             self.current_face_tokens = face_tokens
         
-        # Process body embeddings if provided
-        if body_embeddings is not None and body_embeddings.ndim == 3:
+        # Process body embedding if provided
+        if body_embedding is not None and body_embedding.ndim == 3:
             if batch_size == 1:  # If not set by face, get from body
-                batch_size = body_embeddings.shape[0]
-            body_tokens = self.body_perceiver(body_embeddings)
+                batch_size = body_embedding.shape[0]
+            body_tokens = self.body_perceiver(body_embedding)
             self.current_body_tokens = body_tokens
             
-        # Ensure both have same batch dimension if both exist
-        if face_tokens is not None and body_tokens is not None:
-            if face_tokens.size(0) != body_tokens.size(0):
-                # Expand smaller batch to match larger one
-                if face_tokens.size(0) == 1 and body_tokens.size(0) > 1:
-                    face_tokens = face_tokens.expand(body_tokens.size(0), -1, -1)
-                elif body_tokens.size(0) == 1 and face_tokens.size(0) > 1:
-                    body_tokens = body_tokens.expand(face_tokens.size(0), -1, -1)
-                    
-            # Store updated tensors
-            self.current_face_tokens = face_tokens
-            self.current_body_tokens = body_tokens
-            
-            # Apply fusion if enabled
-            if self.use_identity_fusion:
-                fused_tokens = self.identity_fusion(face_tokens, body_tokens)
-                # Split back to maintain original token counts for each modality
-                face_token_count = face_tokens.size(1)
-                body_token_count = body_tokens.size(1)
-                self.current_face_tokens = fused_tokens[:, :face_token_count, :]
-                self.current_body_tokens = fused_tokens[:, face_token_count:, :]
+        # Apply fusion if both tokens are available and fusion is enabled
+        if face_tokens is not None and body_tokens is not None and self.use_identity_fusion:
+            fused_tokens = self.identity_fusion(face_tokens, body_tokens)
+            # Split back to maintain original token counts for each modality
+            face_token_count = face_tokens.size(1)
+            body_token_count = body_tokens.size(1)
+            self.current_face_tokens = fused_tokens[:, :face_token_count, :]
+            self.current_body_tokens = fused_tokens[:, face_token_count:, :]
     
     def forward(
         self, 
         *args, 
-        face_embeddings: Optional[torch.Tensor] = None,
-        body_embeddings: Optional[torch.Tensor] = None,
+        face_embedding: Optional[torch.Tensor] = None,
+        body_embedding: Optional[torch.Tensor] = None,
         **kwargs
     ):
         """
@@ -706,8 +888,8 @@ class IdentityPreservingFlux(nn.Module):
         
         Args:
             *args: Arguments to pass to the base model
-            face_embeddings: Face embeddings of shape [B, num_faces, 512]
-            body_embeddings: Body embeddings of shape [B, num_persons, 1024]
+            face_embedding: Face embedding of shape [B, 1, 512] (single face)
+            body_embedding: Body embedding of shape [B, 1, 1024] (single body)
             **kwargs: Keyword arguments to pass to the base model
             
         Returns:
@@ -717,8 +899,8 @@ class IdentityPreservingFlux(nn.Module):
             raise ValueError("Base model not loaded. Call load_base_model first.")
             
         # Prepare identity tokens for injection
-        if face_embeddings is not None or body_embeddings is not None:
-            self.prepare_identity_tokens(face_embeddings, body_embeddings)
+        if face_embedding is not None or body_embedding is not None:
+            self.prepare_identity_tokens(face_embedding, body_embedding)
             
         # Forward pass through the base model (hooks will inject identity)
         return self.base_model(*args, **kwargs)
@@ -807,22 +989,15 @@ class IdentityPreservingFlux(nn.Module):
         # Set identity strength
         self.set_identity_strength(face_strength, body_strength)
         
-        # Extract identity from reference image
-        face_embeddings, body_embeddings, face_metadata, body_boxes = self.extract_identity(reference_image)
+        # Extract identity from reference image - now returns single face/body
+        face_embedding, body_embedding, face_metadata, body_box = self.extract_identity(reference_image)
         
         # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
-            from diffusers import FluxPipeline
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
-                model=self.base_model,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else None
-            )
-            
-            # Move to GPU if needed
-            if torch.cuda.is_available():
-                self.pipeline = self.pipeline.to("cuda")
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            ).to("cuda" if torch.cuda.is_available() else "cpu")
         
         # Set up generator if not provided
         if 'generator' not in kwargs and torch.cuda.is_available():
@@ -833,6 +1008,9 @@ class IdentityPreservingFlux(nn.Module):
             kwargs['height'] = 1024
         if 'width' not in kwargs:
             kwargs['width'] = 1024
+        
+        # Prepare identity tokens
+        self.prepare_identity_tokens(face_embedding, body_embedding)
         
         # Generate with identity preservation
         output = self.pipeline(
@@ -880,17 +1058,10 @@ class IdentityPreservingFlux(nn.Module):
         
         # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
-            from diffusers import FluxPipeline
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
-                model=self.base_model,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else None
-            )
-            
-            # Move to GPU if needed
-            if torch.cuda.is_available():
-                self.pipeline = self.pipeline.to("cuda")
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            ).to("cuda" if torch.cuda.is_available() else "cpu")
         
         # Set default height and width if not provided
         if 'height' not in kwargs:
@@ -898,45 +1069,37 @@ class IdentityPreservingFlux(nn.Module):
         if 'width' not in kwargs:
             kwargs['width'] = 1024
         
-        # Process in batches
-        batch_size = min(len(prompts), 1)  # Process one at a time to avoid memory issues with identity embeddings
+        # Process one at a time for consistent handling
         all_images = []
         
-        for i in range(0, len(prompts), batch_size):
-            batch_prompts = prompts[i:i+batch_size]
-            batch_ref_images = reference_images[i:i+batch_size]
-            batch_neg_prompts = None
-            if negative_prompts:
-                batch_neg_prompts = negative_prompts[i:i+batch_size]
+        for i, (prompt, ref_img) in enumerate(zip(prompts, reference_images)):
+            # Set up generator with different seed for each image
+            if torch.cuda.is_available():
+                current_generator = torch.Generator("cuda").manual_seed(int(time.time()) + i)
+            else:
+                current_generator = torch.Generator().manual_seed(int(time.time()) + i)
             
-            # Extract identities for each reference image
-            for j, (prompt, ref_img) in enumerate(zip(batch_prompts, batch_ref_images)):
-                # Set up generator with different seed for each image
-                if torch.cuda.is_available():
-                    current_generator = torch.Generator("cuda").manual_seed(int(time.time()) + j)
-                else:
-                    current_generator = torch.Generator().manual_seed(int(time.time()) + j)
-                
-                # Extract identity
-                face_embeddings, body_embeddings, _, _ = self.extract_identity(ref_img)
-                
-                # Prepare identity tokens
-                self.prepare_identity_tokens(face_embeddings, body_embeddings)
-                
-                # Generate with identity preservation
-                neg_prompt = batch_neg_prompts[j] if batch_neg_prompts else None
-                
-                output = self.pipeline(
-                    prompt=prompt,
-                    negative_prompt=neg_prompt,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    generator=current_generator,
-                    **kwargs
-                )
-                
-                # Collect image
-                all_images.append(output.images[0])
+            # Extract identity - single face/body
+            face_embedding, body_embedding, _, _ = self.extract_identity(ref_img)
+            
+            # Prepare identity tokens
+            self.prepare_identity_tokens(face_embedding, body_embedding)
+            
+            # Get negative prompt if available
+            neg_prompt = negative_prompts[i] if negative_prompts and i < len(negative_prompts) else None
+            
+            # Generate with identity preservation
+            output = self.pipeline(
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=current_generator,
+                **kwargs
+            )
+            
+            # Collect image
+            all_images.append(output.images[0])
         
         return all_images
     
@@ -955,13 +1118,11 @@ class IdentityPreservingFlux(nn.Module):
         
         # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
-            from diffusers import FluxPipeline
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
                 model=self.base_model,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else None
-            )
+            ).to("cuda" if torch.cuda.is_available() else "cpu")
             
             # Move to GPU if needed
             if torch.cuda.is_available():
@@ -1005,13 +1166,11 @@ class IdentityPreservingFlux(nn.Module):
             
         # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
-            from diffusers import FluxPipeline
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
                 model=self.base_model,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else None
-            )
+            ).to("cuda" if torch.cuda.is_available() else "cpu")
             
             # Move to GPU if needed
             if torch.cuda.is_available():
