@@ -258,18 +258,21 @@ class FaceIdentityExtractor(nn.Module):
             face_embedding: torch.Tensor of shape [1, 1, 512] (single face)
             face_metadata: List with single face information dictionary or empty list
         """
+        # Get the device from the model parameters
+        device = next(self.parameters(), torch.tensor(0)).device
+        
         faces = self.face_analyzer.get(img)
         
         if not faces:
             # Return empty embedding if no face detected
-            return torch.zeros(1, 1, 512), []
+            return torch.zeros(1, 1, 512, device=device), []
         
         # Sort faces by area (largest first)
         faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
         
         # Get embedding only for the largest face
         primary_face = faces[0]
-        face_embedding = torch.tensor(primary_face.embedding).unsqueeze(0).unsqueeze(0)  # [1, 1, 512]
+        face_embedding = torch.tensor(primary_face.embedding, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, 512]
         
         # Prepare face metadata for the primary face
         metadata = [{
@@ -390,26 +393,29 @@ class BodyIdentityExtractor(nn.Module):
         Returns:
             features: torch.Tensor of shape [1, 1024]
         """
+        # Get the device from the model parameters
+        device = self.model.device
+        
         H, W = img.shape[:2]
         x1, y1, x2, y2 = [max(0, int(coord)) for coord in box[:4]]
         
         # Crop the image
         cropped_img = img[y1:y2, x1:x2]
         if cropped_img.size == 0:  # If the crop is empty
-            return torch.zeros(1, 1024)
+            return torch.zeros(1, 1024, device=device)
         
         # Check cache if enabled
         if self.use_cached:
             # Simple hash of crop content
             crop_hash = hash(cropped_img.tobytes())
             if crop_hash in self.cached_embeddings:
-                return self.cached_embeddings[crop_hash]
+                # Ensure cached result is on the correct device
+                return self.cached_embeddings[crop_hash].to(device)
         
         # Preprocess the image
         inputs = self.processor(images=cropped_img, return_tensors="pt")
         
         # Move to same device as model
-        device = next(self.model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
         
         # Extract features
@@ -420,7 +426,7 @@ class BodyIdentityExtractor(nn.Module):
         
         # Cache the result if enabled
         if self.use_cached:
-            self.cached_embeddings[crop_hash] = features
+            self.cached_embeddings[crop_hash] = features.detach().clone()
         
         return features
     
@@ -435,6 +441,9 @@ class BodyIdentityExtractor(nn.Module):
             body_embedding: torch.Tensor of shape [1, 1, 1024] (single person)
             body_box: List with single tensor containing [x1, y1, x2, y2, score] or empty list
         """
+        # Get the device from the model parameters
+        device = self.model.device
+        
         start_time = time.time()
         
         # Detect persons
@@ -445,7 +454,7 @@ class BodyIdentityExtractor(nn.Module):
         
         if not boxes:
             # Return empty embedding if no person detected
-            return torch.zeros(1, 1, 1024), []
+            return torch.zeros(1, 1, 1024, device=device), []
         
         # Sort boxes by area (largest first) if there are multiple detections
         if len(boxes) > 1:
@@ -543,6 +552,42 @@ class IdentityPreservingFlux(nn.Module):
         # Identity strength control
         self.face_strength = 1.0
         self.body_strength = 1.0
+        
+        # Training mode flag (to avoid collision with YOLO train method)
+        self.training_mode = True
+    
+    def set_training_mode(self, mode=True):
+        """
+        Set the module in training or evaluation mode.
+        This method overrides nn.Module.train() to avoid conflicts with YOLO.
+        
+        Args:
+            mode: Whether to set training mode (True) or evaluation mode (False)
+        
+        Returns:
+            self
+        """
+        self.training_mode = mode
+        # Apply the mode to all submodules except those with their own train method
+        for module in self.children():
+            if not hasattr(module, 'train') or not callable(module.train) or isinstance(module, nn.Module):
+                if hasattr(module, 'training'):
+                    module.training = mode
+        
+        return self
+        
+    def train(self, mode=True):
+        """
+        Override the train method to use our custom set_training_mode
+        to avoid collisions with YOLO's train method.
+        """
+        return self.set_training_mode(mode)
+    
+    def eval(self):
+        """
+        Override the eval method to use our custom set_training_mode.
+        """
+        return self.set_training_mode(False)
     
     def set_identity_strength(self, face_strength: float = 1.0, body_strength: float = 1.0):
         """Set the strength of identity preservation (0.0-1.0)"""
@@ -802,29 +847,135 @@ class IdentityPreservingFlux(nn.Module):
     
     def extract_identity(self, image):
         """
-        Extract face and body identity from an image.
+        Extract face and body identity from an image or batch of images.
         
         Args:
-            image: Either a PIL Image, numpy array, or path to an image file
+            image: Either a PIL Image, numpy array, torch.Tensor, or path to an image file.
+                 For tensors, can handle a batch [B, C, H, W] or a single image [C, H, W].
             
         Returns:
-            face_embedding: torch.Tensor of shape [1, 1, 512] (single face)
-            body_embedding: torch.Tensor of shape [1, 1, 1024] (single body)
-            face_metadata: Dictionary of face information for the primary face
-            body_box: Tensor containing [x1, y1, x2, y2, score] for the primary body
+            face_embedding: torch.Tensor of shape [B, 1, 512] for batch or [1, 1, 512] for single image
+            body_embedding: torch.Tensor of shape [B, 1, 1024] for batch or [1, 1, 1024] for single image
+            face_metadata: List of dictionaries with face information (one per batch item or single)
+            body_box: List of tensors containing [x1, y1, x2, y2, score] (one per batch item or single)
         """
+        # Get device from the model
+        device = next(self.parameters()).device
+        
+        # Special handling for tensor batch processing
+        if isinstance(image, torch.Tensor) and image.dim() == 4 and image.shape[0] > 1:
+            batch_size = image.shape[0]
+            
+            # Initialize outputs
+            all_face_embeddings = []
+            all_body_embeddings = []
+            all_face_metadata = []
+            all_body_boxes = []
+            
+            # Process each image in the batch
+            for i in range(batch_size):
+                single_img = image[i:i+1]  # Keep batch dimension as [1, C, H, W]
+                
+                # Convert tensor to numpy array for processing
+                single_img_np = single_img.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                
+                # Handle normalization
+                if single_img_np.min() < 0 or single_img_np.max() > 1:
+                    # Denormalize if image was normalized with mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+                    mean = np.array([0.5, 0.5, 0.5])
+                    std = np.array([0.5, 0.5, 0.5])
+                    single_img_np = std * single_img_np + mean
+                
+                # Scale to [0, 255] and convert to uint8
+                single_img_np = np.clip(single_img_np * 255, 0, 255).astype(np.uint8)
+                
+                # Process the numpy array
+                face_emb, body_emb, face_meta, body_box = self._process_identity_from_numpy(single_img_np)
+                
+                # Move to same device as model
+                face_emb = face_emb.to(device)
+                body_emb = body_emb.to(device)
+                
+                all_face_embeddings.append(face_emb)
+                all_body_embeddings.append(body_emb)
+                all_face_metadata.append(face_meta)
+                all_body_boxes.append(body_box)
+                
+            # Combine results - ensure all tensors are on the same device
+            face_embedding = torch.cat(all_face_embeddings, dim=0).to(device)
+            body_embedding = torch.cat(all_body_embeddings, dim=0).to(device)
+            
+            return face_embedding, body_embedding, all_face_metadata, all_body_boxes
+        
+        # Single image processing (including single tensor with batch dim = 1)
         # Convert image to numpy array if needed
         if isinstance(image, str):
             from PIL import Image
             image = np.array(Image.open(image).convert('RGB'))
         elif hasattr(image, 'mode'):  # PIL Image
             image = np.array(image.convert('RGB'))
+        elif isinstance(image, torch.Tensor):  # PyTorch tensor
+            # Handle single image with batch dimension
+            if image.dim() == 4 and image.shape[0] == 1:
+                image = image.squeeze(0)
+                
+            # Convert tensor to numpy array
+            image = image.permute(1, 2, 0).cpu().numpy()
+            
+            # Handle normalization
+            if image.min() < 0 or image.max() > 1:
+                # Denormalize if image was normalized with mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+                mean = np.array([0.5, 0.5, 0.5])
+                std = np.array([0.5, 0.5, 0.5])
+                image = std * image + mean
+                
+            # Scale to [0, 255] and convert to uint8
+            image = np.clip(image * 255, 0, 255).astype(np.uint8)
+        
+        # Process and move results to the correct device
+        face_embedding, body_embedding, face_metadata, body_box = self._process_identity_from_numpy(image)
+        face_embedding = face_embedding.to(device)
+        body_embedding = body_embedding.to(device) 
+        
+        return face_embedding, body_embedding, face_metadata, body_box
+    
+    def _process_identity_from_numpy(self, img_np):
+        """
+        Helper method to process numpy array image for identity extraction.
+        
+        Args:
+            img_np: Numpy array of shape [H, W, C] in RGB format
+            
+        Returns:
+            face_embedding: torch.Tensor of shape [1, 1, 512]
+            body_embedding: torch.Tensor of shape [1, 1, 1024]
+            face_metadata: Dict with face information or {}
+            body_box: Tensor containing [x1, y1, x2, y2, score] or None
+        """
+        # Get device from the model
+        device = next(self.parameters()).device
         
         # Extract face embeddings
-        face_embeddings, face_metadata = self.face_extractor(image)
+        try:
+            face_embeddings, face_metadata = self.face_extractor(img_np)
+            # Move embeddings to the correct device
+            face_embeddings = face_embeddings.to(device)
+        except Exception as e:
+            print(f"Error in face extraction: {e}")
+            # Return zero tensor if face extraction fails
+            face_embeddings = torch.zeros(1, 1, 512, device=device)
+            face_metadata = []
         
         # Extract body embeddings
-        body_embeddings, body_boxes = self.body_extractor(image)
+        try:
+            body_embeddings, body_boxes = self.body_extractor(img_np)
+            # Move embeddings to the correct device
+            body_embeddings = body_embeddings.to(device)
+        except Exception as e:
+            print(f"Error in body extraction: {e}")
+            # Return zero tensor if body extraction fails
+            body_embeddings = torch.zeros(1, 1, 1024, device=device)
+            body_boxes = []
         
         # Take only the first/primary face embedding
         # If no faces detected, face_embeddings will already be a zero tensor of shape [1, 1, 512]
@@ -850,18 +1001,25 @@ class IdentityPreservingFlux(nn.Module):
             face_embedding: Tensor of shape [batch_size, 1, face_dim] (single face)
             body_embedding: Tensor of shape [batch_size, 1, body_dim] (single body)
         """
+        device = next(self.parameters()).device
         face_tokens = None
         body_tokens = None
         batch_size = 1  # Default batch size
         
         # Process face embedding if provided
         if face_embedding is not None and face_embedding.ndim == 3:
+            # Ensure it's on the correct device
+            face_embedding = face_embedding.to(device)
+            
             batch_size = face_embedding.shape[0]
             face_tokens = self.face_perceiver(face_embedding)
             self.current_face_tokens = face_tokens
         
         # Process body embedding if provided
         if body_embedding is not None and body_embedding.ndim == 3:
+            # Ensure it's on the correct device
+            body_embedding = body_embedding.to(device)
+            
             if batch_size == 1:  # If not set by face, get from body
                 batch_size = body_embedding.shape[0]
             body_tokens = self.body_perceiver(body_embedding)
