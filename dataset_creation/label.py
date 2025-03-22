@@ -5,6 +5,7 @@ from lmdeploy import pipeline, TurbomindEngineConfig
 from lmdeploy.vl import load_image
 from os.path import join
 import nest_asyncio
+from PIL import Image
 nest_asyncio.apply()
 
 
@@ -105,7 +106,18 @@ async def process_char_dir(char_dir):
 
     img_paths = sorted([join(char_dir, f) for f in os.listdir(char_dir) if f.lower().endswith('.jpg')])
     logging.info(f"Found {len(img_paths)} images in {char_dir}")
-    tasks = [asyncio.to_thread(load_image, img_path) for img_path in img_paths]
+    
+    # Load and downscale images
+    async def load_and_downscale(img_path):
+        img = Image.open(img_path)
+        width, height = img.size
+        # Calculate scale so that the larger side becomes 512px
+        scale = 512 / max(width, height)
+        new_size = (int(width * scale), int(height * scale))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+        return img
+    
+    tasks = [load_and_downscale(img_path) for img_path in img_paths]
     imgs = await asyncio.gather(*tasks)
     prompts = [(prompt, img) for img in imgs]
 
