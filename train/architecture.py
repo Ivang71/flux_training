@@ -90,101 +90,96 @@ class IdentityInjectionLayer(nn.Module):
         
         # For storing attention maps for visualization
         self.last_attention_map = None
+        
+        # Add conv layers for handling image-like inputs
+        self.img_to_feature = nn.Conv2d(3, feature_dim, kernel_size=1, stride=1, padding=0)
+        self.feature_to_img = nn.Conv2d(feature_dim, 3, kernel_size=1, stride=1, padding=0)
     
     def forward(self, hidden_states: torch.Tensor, identity_tokens: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
-        # Store original shape for later reshape
+        # Store original shape and dtype for later
         original_shape = hidden_states.shape
         original_dtype = hidden_states.dtype
         
-        # Print shape information for debugging
-        print(f"Hidden states shape: {hidden_states.shape}, Identity tokens shape: {identity_tokens.shape}")
-        print(f"Hidden states dtype: {hidden_states.dtype}, Identity tokens dtype: {identity_tokens.dtype}")
+        # Check if input is image-like (B, C, H, W)
+        is_image_like = len(original_shape) == 4 and original_shape[1] == 3
         
-        # Adapt the hidden states to the expected format [B, seq_len, dim]
-        if len(original_shape) == 4:  # [B, C, H, W]
-            B, C, H, W = original_shape
-            hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(B, H*W, C)
-        elif len(original_shape) == 3 and original_shape[2] != self.feature_dim:
-            # If the last dimension doesn't match feature_dim, reshape is needed
-            B, seq_len, C = original_shape
-            # Use reshape or projection based on dimensions
-            if C % self.feature_dim == 0:
-                # Reshape to merge dimensions
-                factor = C // self.feature_dim
-                hidden_states = hidden_states.reshape(B, seq_len * factor, self.feature_dim)
-            else:
-                # Project to the correct dimension using a dynamic projection
-                print(f"Creating dynamic projection from {C} to {self.feature_dim}")
-                projection = nn.Linear(C, self.feature_dim).to(hidden_states.device)
+        # Handle image-like inputs by converting to feature space first
+        if is_image_like:
+            # Use spatial convolution to map 3 channels to feature_dim channels
+            # This is more memory efficient than reshaping to [B, H*W, 3] and using linear
+            hidden_states = self.img_to_feature(hidden_states)  # [B, feature_dim, H, W]
+            B, C, H, W = hidden_states.shape
+            hidden_states = hidden_states.permute(0, 2, 3, 1)  # [B, H, W, feature_dim]
+            hidden_states = hidden_states.reshape(B, H*W, C)  # [B, H*W, feature_dim]
+        
+        # For non-image tensors that don't match feature_dim
+        elif hidden_states.shape[-1] != self.feature_dim:
+            # Use 1x1 convolution for more efficient projection
+            if len(hidden_states.shape) == 3:
+                B, seq_len, C = hidden_states.shape
+                # Project to feature dimension with a linear layer
+                projection = nn.Linear(C, self.feature_dim, device=hidden_states.device)
                 hidden_states = projection(hidden_states)
-                
-        # Convert to the same dtype if needed
-        if hidden_states.dtype != identity_tokens.dtype:
-            identity_tokens = identity_tokens.to(dtype=hidden_states.dtype)
         
         # Project identity tokens if dimensions don't match
         if identity_tokens.shape[-1] != self.feature_dim:
             identity_tokens = self.identity_proj(identity_tokens)
         
-        # First run the layer norm on hidden states
-        try:
-            norm_hidden = self.norm1(hidden_states)
-        except Exception as e:
-            print(f"Error in norm1: {e}")
-            print(f"Using custom normalization due to dimension mismatch")
-            # Apply a custom normalization as fallback
-            norm_hidden = F.layer_norm(
-                hidden_states, 
-                normalized_shape=[hidden_states.shape[-1]], 
-                weight=None, 
-                bias=None
-            )
+        # Make sure identity tokens are the same dtype as hidden states
+        identity_tokens = identity_tokens.to(dtype=hidden_states.dtype)
         
-        # Attention block
-        try:
+        # Apply layer normalization to hidden states
+        norm_hidden = self.norm1(hidden_states)
+        
+        # Apply attention with proper error handling and memory constraints
+        # Use chunked processing for large sequences to avoid OOM
+        chunk_size = 16384  # Process in chunks to avoid OOM
+        num_chunks = (norm_hidden.shape[1] + chunk_size - 1) // chunk_size
+        
+        # Process in chunks if sequence length is large
+        if num_chunks > 1:
+            chunks = []
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, norm_hidden.shape[1])
+                
+                chunk = norm_hidden[:, start_idx:end_idx, :]
+                attn_output, _ = self.attn(
+                    query=chunk,
+                    key=identity_tokens,
+                    value=identity_tokens
+                )
+                chunks.append(attn_output)
+            
+            attn_output = torch.cat(chunks, dim=1)
+        else:
+            # Process in a single pass for small sequences
             attn_output, attn_weights = self.attn(
                 query=norm_hidden,
                 key=identity_tokens,
                 value=identity_tokens
             )
-            
             # Store attention map for visualization
             self.last_attention_map = attn_weights
-            
-            # Apply identity strength control
-            hidden_states = hidden_states + (attn_output * strength)
-        except Exception as e:
-            print(f"Error in attention: {e}")
-            print("Skipping attention due to dimension mismatch")
-            # Return original hidden states if attention fails
-            return hidden_states
+        
+        # Apply identity strength control
+        hidden_states = hidden_states + (attn_output * strength)
         
         # Feed-forward block
-        try:
-            norm_hidden = self.norm2(hidden_states)
-            ff_output = self.ff(norm_hidden)
-            hidden_states = hidden_states + ff_output
-        except Exception as e:
-            print(f"Error in feed-forward: {e}")
-            print("Skipping feed-forward due to dimension mismatch")
+        norm_hidden = self.norm2(hidden_states)
+        ff_output = self.ff(norm_hidden)
+        hidden_states = hidden_states + ff_output
         
-        # Reshape back to the original dimensions if needed
-        if len(original_shape) == 4:  # [B, C, H, W]
+        # Convert back to original shape if needed
+        if is_image_like:
             B, HW, C = hidden_states.shape
             H = W = int(np.sqrt(HW))
             hidden_states = hidden_states.reshape(B, H, W, C).permute(0, 3, 1, 2)
-        elif len(original_shape) == 3 and original_shape[2] != self.feature_dim:
-            # Try to reshape back to original dimensions
-            B, seq_len_new, C_new = hidden_states.shape
-            if original_shape[2] % C_new == 0:
-                factor = original_shape[2] // C_new
-                hidden_states = hidden_states.reshape(B, original_shape[1], original_shape[2])
-            
-        # Convert back to original dtype if needed
-        if hidden_states.dtype != original_dtype:
-            hidden_states = hidden_states.to(dtype=original_dtype)
-            
-        return hidden_states
+            # Map feature dim back to 3 channels
+            hidden_states = self.feature_to_img(hidden_states)
+        
+        # Ensure we return the correct dtype
+        return hidden_states.to(dtype=original_dtype)
 
 
 class IdentityFusionModule(nn.Module):

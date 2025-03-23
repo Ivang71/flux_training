@@ -17,6 +17,22 @@ The Identity-Preserving model is designed to maintain a person's identity featur
 - `train_identity_preserving.py`: Core training loop and model definitions
 - `architecture.py`: Implementation of the IdentityPreservingFlux model
 - `config.yaml`: Configuration file with training parameters
+- `convert_to_safetensors.py`: Utility script to convert PyTorch checkpoints to safetensors format
+
+## Safetensors Support
+
+The training pipeline now uses the safetensors format for saving and loading model checkpoints:
+
+- Model checkpoints are saved with `.safetensors` extension
+- Improved security by avoiding pickle-based serialization
+- Better compatibility with different platforms and frameworks
+- Faster loading times for large models
+
+To convert existing PyTorch checkpoints to safetensors format, use the provided utility script:
+
+```bash
+python convert_to_safetensors.py --input checkpoints/ --output safetensors_checkpoints/ --recursive
+```
 
 ## Dataset Format
 

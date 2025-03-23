@@ -9,10 +9,18 @@ import matplotlib.pyplot as plt
 from torchvision import transforms
 from pathlib import Path
 from safetensors.torch import load_file
+import torch.nn as nn
+import logging
+import time
+import re
 
 # Import the architecture
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from train.architecture import IdentityPreservingFlux
+
+# Configure logger
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def load_config(config_path):
     """Load configuration from YAML file"""
@@ -33,6 +41,7 @@ def load_model(checkpoint_path, config=None):
     """
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
     # Initialize model parameters
     model_params = {}
@@ -50,6 +59,7 @@ def load_model(checkpoint_path, config=None):
     
     # Initialize model
     model = IdentityPreservingFlux(**model_params)
+    print(f"Model created with config: {model_params}")
     
     # Load base model
     model.load_base_model()
@@ -57,23 +67,40 @@ def load_model(checkpoint_path, config=None):
     # Check file extension to determine loading method
     if checkpoint_path.endswith('.safetensors'):
         # Load using safetensors
-        checkpoint = load_file(checkpoint_path, device=device)
+        print(f"Loading safetensors checkpoint from {checkpoint_path}")
+        loaded_state_dict = load_file(checkpoint_path)
         
-        # Handle different state dict keys based on how it was saved
-        if 'model' in checkpoint:
-            model.load_state_dict(checkpoint['model'])
-        else:
-            model.load_state_dict(checkpoint)
-            
+        # Extract metadata
+        metadata = {}
+        for key in loaded_state_dict:
+            if not key.startswith('model_state_dict.'):
+                try:
+                    # Try to convert numeric values
+                    if loaded_state_dict[key].numel() == 1:
+                        value = loaded_state_dict[key].item()
+                        metadata[key] = value
+                except:
+                    pass
+        
+        # Extract model state dict
+        model_state_dict = {}
+        for key in loaded_state_dict:
+            if key.startswith('model_state_dict.'):
+                param_name = key[len('model_state_dict.'):]
+                model_state_dict[param_name] = loaded_state_dict[key]
+        
+        # Load state dict
+        model.load_state_dict(model_state_dict)
+        
         # Get metadata if available
-        epoch = checkpoint.get('epoch', 0)
-        train_metrics = checkpoint.get('train_metrics', {'loss': 0.0})
-        val_metrics = checkpoint.get('val_metrics', {'loss': 0.0})
+        epoch = metadata.get('epoch', 0)
+        train_metrics = metadata.get('train_metrics', {'loss': 0.0})
+        val_metrics = metadata.get('val_metrics', {'loss': 0.0})
         
         print(f"Model loaded from {checkpoint_path} (safetensors format)")
-        if 'epoch' in checkpoint:
+        if 'epoch' in metadata:
             print(f"Trained for {epoch} epochs")
-        if 'train_metrics' in checkpoint and 'val_metrics' in checkpoint:
+        if 'train_metrics' in metadata and 'val_metrics' in metadata:
             train_loss = train_metrics.get('loss', 0.0)
             val_loss = val_metrics.get('loss', 0.0)
             print(f"Training loss: {train_loss:.4f}, Validation loss: {val_loss:.4f}")

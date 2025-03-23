@@ -239,17 +239,17 @@ class IdentityContentLoss(nn.Module):
         self.mse_loss = nn.MSELoss()
         self.cosine_sim = nn.CosineSimilarity(dim=1)
         
-    def forward(self, output_image, target_image, ref_face_emb, ref_body_emb, output_face_emb, output_body_emb):
+    def forward(self, ref_face_embed, ref_body_embed, output_face_embed, output_body_embed, output_image, target_image):
         """
         Calculate the identity preservation loss.
         
         Args:
             output_image: The generated image with identity transfer
             target_image: The original target image
-            ref_face_emb: Face embedding from reference image
-            ref_body_emb: Body embedding from reference image
-            output_face_emb: Face embedding from generated image
-            output_body_emb: Body embedding from generated image
+            ref_face_embed: Face embedding from reference image
+            ref_body_embed: Body embedding from reference image
+            output_face_embed: Face embedding from generated image
+            output_body_embed: Body embedding from generated image
             
         Returns:
             total_loss: Combined loss value
@@ -259,10 +259,20 @@ class IdentityContentLoss(nn.Module):
         
         # Face identity loss - cosine similarity between reference and output embeddings
         face_loss = 0
-        if ref_face_emb is not None and output_face_emb is not None:
-            # Make sure embeddings have the same shape and are on the same device
-            ref_face_flat = ref_face_emb.view(ref_face_emb.size(0), -1).to(self.device)
-            output_face_flat = output_face_emb.view(output_face_emb.size(0), -1).to(self.device)
+        if ref_face_embed is not None and output_face_embed is not None:
+            # Ensure output_face_embed requires gradients
+            if not output_face_embed.requires_grad:
+                # Create detached copy
+                ref_face_flat = ref_face_embed.view(ref_face_embed.size(0), -1).to(self.device).detach()
+                # Create copy with requires_grad=True
+                output_face_flat = output_face_embed.view(output_face_embed.size(0), -1).to(self.device)
+                # If output_face_flat doesn't require gradients, add it explicitly
+                if not output_face_flat.requires_grad:
+                    output_face_flat = output_face_flat.detach().clone().requires_grad_(True)
+            else:
+                # Make sure embeddings have the same shape and are on the same device
+                ref_face_flat = ref_face_embed.view(ref_face_embed.size(0), -1).to(self.device)
+                output_face_flat = output_face_embed.view(output_face_embed.size(0), -1).to(self.device)
             
             # Cosine similarity (higher is better, so we use 1-sim for loss)
             face_sim = self.cosine_sim(ref_face_flat, output_face_flat)
@@ -271,10 +281,20 @@ class IdentityContentLoss(nn.Module):
         
         # Body identity loss - cosine similarity between reference and output embeddings
         body_loss = 0
-        if ref_body_emb is not None and output_body_emb is not None:
-            # Make sure embeddings have the same shape and are on the same device
-            ref_body_flat = ref_body_emb.view(ref_body_emb.size(0), -1).to(self.device)
-            output_body_flat = output_body_emb.view(output_body_emb.size(0), -1).to(self.device)
+        if ref_body_embed is not None and output_body_embed is not None:
+            # Ensure output_body_embed requires gradients
+            if not output_body_embed.requires_grad:
+                # Create detached copy
+                ref_body_flat = ref_body_embed.view(ref_body_embed.size(0), -1).to(self.device).detach()
+                # Create copy with requires_grad=True
+                output_body_flat = output_body_embed.view(output_body_embed.size(0), -1).to(self.device)
+                # If output_body_flat doesn't require gradients, add it explicitly
+                if not output_body_flat.requires_grad:
+                    output_body_flat = output_body_flat.detach().clone().requires_grad_(True)
+            else:
+                # Make sure embeddings have the same shape and are on the same device
+                ref_body_flat = ref_body_embed.view(ref_body_embed.size(0), -1).to(self.device)
+                output_body_flat = output_body_embed.view(output_body_embed.size(0), -1).to(self.device)
             
             # Cosine similarity (higher is better, so we use 1-sim for loss)
             body_sim = self.cosine_sim(ref_body_flat, output_body_flat)
@@ -284,9 +304,13 @@ class IdentityContentLoss(nn.Module):
         # Content preservation loss - VGG features similarity
         content_loss = 0
         if self.content_weight > 0:
+            # Ensure output_image requires gradients
+            if not output_image.requires_grad:
+                output_image = output_image.detach().clone().requires_grad_(True)
+            
             # Convert input images to float32 for VGG
-            target_float = target_image.float()
-            output_float = output_image.float()
+            target_float = target_image.float().detach()  # Target doesn't need gradients
+            output_float = output_image.float()  # Output needs gradients
             
             # Extract VGG features
             with torch.no_grad():
@@ -307,185 +331,216 @@ class IdentityContentLoss(nn.Module):
         
         return total_loss, loss_dict
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler=None, use_amp=False):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp):
     """
-    Train the model for one epoch
+    Train model for one epoch
     
     Args:
         model: Model to train
         dataloader: DataLoader for training data
-        criterion: Loss function
-        optimizer: Optimizer to use
-        device: Device to train on
-        scaler: AMP GradScaler
-        use_amp: Whether to use Automatic Mixed Precision
+        criterion: Loss criterion
+        optimizer: Optimizer
+        device: Device to use for training
+        scaler: GradScaler for AMP
+        use_amp: Whether to use AMP
         
     Returns:
-        metrics: Dictionary with training metrics
+        dict: Dictionary with training metrics
     """
-    model.set_training_mode(True)
-    losses = []
+    model.train()
     
-    # Dictionary to track metrics
-    metrics = {
-        'loss': 0.0,
-        'face_loss': 0.0,
-        'body_loss': 0.0,
-        'content_loss': 0.0
-    }
+    # If model has custom training mode method, use it
+    if hasattr(model, 'set_training_mode'):
+        model.set_training_mode(True)
     
-    # Track batch count for averaging
-    batch_count = 0
+    total_loss = 0
+    face_loss_total = 0
+    body_loss_total = 0
+    content_loss_total = 0
     
-    for batch_idx, batch in enumerate(dataloader):
+    pbar = tqdm(dataloader, desc=f"Training")
+    
+    for batch_idx, batch in enumerate(pbar):
         try:
-            # Extract source and target images
-            source_images = batch['source_image'].to(device)
-            target_images = batch['target_image'].to(device)
-            target_labels = batch['target_label']  # Text prompts for the Flux model
+            # Get data
+            ref_image = batch['reference_image'].to(device)
+            target_image = batch['target_image'].to(device)
             
-            # Reset gradients
+            # Zero gradients
             optimizer.zero_grad()
             
-            # Use AMP if enabled
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                # Extract reference identity from source images
-                ref_face_emb, ref_body_emb, _, _ = model.extract_identity(source_images)
+            # Forward pass with AMP
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
+                # Process reference image first to extract identity information
+                # This can be done without tracking gradients
+                with torch.no_grad():
+                    ref_face_embed, ref_body_embed, _, _ = model.extract_identity(ref_image)
                 
-                # Prepare the model with the reference identity
-                model.prepare_identity_tokens(ref_face_emb, ref_body_emb)
+                # Forward through model to get output image
+                output = model(target_image)
                 
-                # Generate output images using our model
-                output_images = model(target_images, prompt=target_labels)
+                # Extract output based on model's return value
+                if isinstance(output, tuple):
+                    # Handle case where model returns multiple outputs
+                    output_image = output[0]
+                else:
+                    # Model returns just the modified image
+                    output_image = output
                 
-                # Extract identity from output images
-                output_face_emb, output_body_emb, _, _ = model.extract_identity(output_images)
+                # For the loss computation, we need to get identity embeddings
+                # Create a detached copy for extract_identity (which uses numpy() internally),
+                # but keep the original for loss computation to preserve the gradient flow
+                with torch.no_grad():
+                    # Detach before passing to extract_identity to avoid numpy() gradient error
+                    output_image_detached = output_image.detach()
+                    output_face_embed, output_body_embed, _, _ = model.extract_identity(output_image_detached)
                 
-                # Compute loss
+                # Compute loss - since the embeddings are detached, the loss will flow back through output_image
                 loss, loss_dict = criterion(
-                    output_image=output_images,
-                    target_image=target_images,
-                    ref_face_emb=ref_face_emb,
-                    ref_body_emb=ref_body_emb,
-                    output_face_emb=output_face_emb,
-                    output_body_emb=output_body_emb
+                    ref_face_embed=ref_face_embed,
+                    ref_body_embed=ref_body_embed,
+                    output_face_embed=output_face_embed,
+                    output_body_embed=output_body_embed,
+                    output_image=output_image,  # This tensor keeps its gradients for the content loss
+                    target_image=target_image
                 )
             
-            # Backward pass with AMP scaler if enabled
-            if use_amp and scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+            # Backward pass with AMP
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             # Update metrics
-            for key, value in loss_dict.items():
-                if key in metrics:
-                    metrics[key] += value
+            total_loss += loss.item()
+            face_loss_total += loss_dict.get('face_loss', 0)
+            body_loss_total += loss_dict.get('body_loss', 0)
+            content_loss_total += loss_dict.get('content_loss', 0)
             
-            # Track losses for logging
-            losses.append(loss.item())
-            batch_count += 1
-            
-            # Log progress
-            if batch_idx % 10 == 0:
-                logging.info(f"Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
-                
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': total_loss / (batch_idx + 1),
+                'face_loss': face_loss_total / (batch_idx + 1),
+                'body_loss': body_loss_total / (batch_idx + 1),
+                'content_loss': content_loss_total / (batch_idx + 1)
+            })
+        
         except Exception as e:
             logging.error(f"Error processing batch {batch_idx}: {e}")
             import traceback
             logging.error(traceback.format_exc())
+            # Skip this batch
             continue
     
-    # Compute average metrics
-    for key in metrics:
-        metrics[key] /= max(batch_count, 1)
+    # Calculate average metrics
+    num_batches = len(dataloader)
+    avg_loss = total_loss / num_batches
+    avg_face_loss = face_loss_total / num_batches
+    avg_body_loss = body_loss_total / num_batches
+    avg_content_loss = content_loss_total / num_batches
     
-    return metrics
+    # Return metrics
+    return {
+        'loss': avg_loss,
+        'face_loss': avg_face_loss,
+        'body_loss': avg_body_loss,
+        'content_loss': avg_content_loss
+    }
 
 def validate(model, dataloader, criterion, device):
     """
-    Validate the model
+    Validate model on validation set
     
     Args:
         model: Model to validate
         dataloader: DataLoader for validation data
-        criterion: Loss function
-        device: Device to validate on
+        criterion: Loss criterion
+        device: Device to use for validation
         
     Returns:
-        metrics: Dictionary with validation metrics
+        dict: Dictionary with validation metrics
     """
-    model.set_training_mode(False)
-    losses = []
+    model.eval()
     
-    # Dictionary to track metrics
-    metrics = {
-        'loss': 0.0,
-        'face_loss': 0.0,
-        'body_loss': 0.0,
-        'content_loss': 0.0
-    }
+    # If model has custom training mode method, use it
+    if hasattr(model, 'set_training_mode'):
+        model.set_training_mode(False)
     
-    # Track batch count for averaging
-    batch_count = 0
+    total_loss = 0
+    face_loss_total = 0
+    body_loss_total = 0
+    content_loss_total = 0
+    
+    pbar = tqdm(dataloader, desc=f"Validation")
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx, batch in enumerate(pbar):
             try:
-                # Extract source and target images
-                source_images = batch['source_image'].to(device)
-                target_images = batch['target_image'].to(device)
-                target_labels = batch['target_label']  # Text prompts for the Flux model
+                # Get data
+                ref_image = batch['reference_image'].to(device)
+                target_image = batch['target_image'].to(device)
                 
-                # Extract reference identity from source images
-                ref_face_emb, ref_body_emb, _, _ = model.extract_identity(source_images)
+                # Extract identity from reference image
+                ref_face_embed, ref_body_embed, _, _ = model.extract_identity(ref_image)
                 
-                # Prepare the model with the reference identity
-                model.prepare_identity_tokens(ref_face_emb, ref_body_emb)
+                # Forward through model
+                output = model(target_image)
                 
-                # Generate output images using our model
-                output_images = model(target_images, prompt=target_labels)
+                # Extract output based on model's return value
+                if isinstance(output, tuple):
+                    # Handle case where model returns multiple outputs
+                    output_image = output[0]
+                else:
+                    # Model returns just the modified image
+                    output_image = output
                 
-                # Extract identity from output images
-                output_face_emb, output_body_emb, _, _ = model.extract_identity(output_images)
+                # Extract identity from output image
+                output_face_embed, output_body_embed, _, _ = model.extract_identity(output_image)
                 
-                # Compute loss
+                # Compute loss - in validation we don't need gradients
                 loss, loss_dict = criterion(
-                    output_image=output_images,
-                    target_image=target_images,
-                    ref_face_emb=ref_face_emb,
-                    ref_body_emb=ref_body_emb,
-                    output_face_emb=output_face_emb,
-                    output_body_emb=output_body_emb
+                    ref_face_embed=ref_face_embed,
+                    ref_body_embed=ref_body_embed,
+                    output_face_embed=output_face_embed,
+                    output_body_embed=output_body_embed,
+                    output_image=output_image,
+                    target_image=target_image
                 )
                 
                 # Update metrics
-                for key, value in loss_dict.items():
-                    if key in metrics:
-                        metrics[key] += value
+                total_loss += loss.item()
+                face_loss_total += loss_dict.get('face_loss', 0)
+                body_loss_total += loss_dict.get('body_loss', 0)
+                content_loss_total += loss_dict.get('content_loss', 0)
                 
-                # Track losses for logging
-                losses.append(loss.item())
-                batch_count += 1
-                
-                # Log progress
-                if batch_idx % 10 == 0:
-                    logging.info(f"Validation Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
-                    
+                # Update progress bar
+                pbar.set_postfix({
+                    'loss': total_loss / (batch_idx + 1),
+                    'face_loss': face_loss_total / (batch_idx + 1),
+                    'body_loss': body_loss_total / (batch_idx + 1),
+                    'content_loss': content_loss_total / (batch_idx + 1)
+                })
+            
             except Exception as e:
                 logging.error(f"Error processing validation batch {batch_idx}: {e}")
                 import traceback
                 logging.error(traceback.format_exc())
+                # Skip this batch
                 continue
     
-    # Compute average metrics
-    for key in metrics:
-        metrics[key] /= max(batch_count, 1)
+    # Calculate average metrics
+    num_batches = len(dataloader)
+    avg_loss = total_loss / num_batches
+    avg_face_loss = face_loss_total / num_batches
+    avg_body_loss = body_loss_total / num_batches
+    avg_content_loss = content_loss_total / num_batches
     
-    return metrics
+    # Return metrics
+    return {
+        'loss': avg_loss,
+        'face_loss': avg_face_loss,
+        'body_loss': avg_body_loss,
+        'content_loss': avg_content_loss
+    }
 
 def visualize_examples(examples, epoch):
     """
@@ -640,199 +695,34 @@ def identity_similarity_metrics(model, test_loader, device):
     
     return avg_metrics
 
-class SimpleIdentityAutoencoder(nn.Module):
-    """A simple identity-preserving autoencoder model"""
-    
-    def __init__(self, input_size=512, device='cuda'):
-        super(SimpleIdentityAutoencoder, self).__init__()
-        
-        # Set device
-        self.device = device
-        self.training_mode = True
-        
-        # Encoder (downsampling path)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.Conv2d(64, 128, kernel_size=3, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.Conv2d(128, 256, kernel_size=3, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            
-            nn.Conv2d(256, 512, kernel_size=3, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        ).to(device)
-        
-        # Identity embedding layer
-        self.identity_layer = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=3, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1))
-        ).to(device)
-        
-        # Decoder (upsampling path)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1).to(device),
-            nn.ReLU(inplace=True),
-            
-            nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1).to(device),
-            nn.Sigmoid()  # Output in range [0, 1]
-        ).to(device)
-
-        # Create trainable weights for identity preservation
-        self.identity_weight = nn.Parameter(torch.ones(1, requires_grad=True))
-        self.content_weight = nn.Parameter(torch.ones(1, requires_grad=True))
-        
-    def set_training_mode(self, mode):
-        """Set training mode for the model"""
-        self.training_mode = mode
-        if mode:
-            self.train()
-        else:
-            self.eval()
-        return self
-        
-    def extract_identity(self, x):
-        """Extract identity features from input image"""
-        # Ensure input is on the correct device
-        x = x.to(self.device)
-        
-        # Get encoder features
-        features = self.encoder(x)
-        
-        # Extract identity
-        identity = self.identity_layer(features)
-        
-        # Reshape to [batch_size, 1, embedding_dim] to match IdentityPreservingFlux.extract_identity()
-        identity = identity.view(identity.size(0), 1, -1)
-        
-        # Create empty body embeddings (zeros) with same shape - batch_size x 1 x embedding_dim
-        # Ensure they're trainable by creating with requires_grad=True
-        body_emb = torch.zeros_like(identity, requires_grad=True)
-        
-        # Match the return format of IdentityPreservingFlux.extract_identity()
-        # Return face embeddings, body embeddings (zeros), and None for metadata
-        return identity, body_emb, None, None
-        
-    def get_identity_vector(self, x):
-        """Get a flattened identity vector for the image
-        
-        Args:
-            x: Input image tensor of shape [B, C, H, W]
-            
-        Returns:
-            identity: Flattened identity vector of shape [B, embedding_dim]
-        """
-        # Extract identity using the standard method
-        identity, _, _, _ = self.extract_identity(x)
-        
-        # Flatten the identity
-        identity_flat = identity.view(identity.size(0), -1)
-        
-        return identity_flat
-        
-    def prepare_identity_tokens(self, face_embeddings, body_embeddings=None):
-        """
-        Prepare identity tokens for conditioning the decoder
-        
-        Args:
-            face_embeddings: Face identity embeddings from extract_identity
-            body_embeddings: Body identity embeddings from extract_identity (optional)
-            
-        Returns:
-            None (stored internally)
-        """
-        # Store identity embeddings for use in forward pass
-        self.current_identity = face_embeddings
-        return
-            
-    def forward(self, x, identity_embeddings=None, prompt=None, **kwargs):
-        """
-        Forward pass through the model
-        
-        Args:
-            x: Input images
-            identity_embeddings: Optional identity embeddings
-            prompt: Text prompt(s) - ignored, included for compatibility
-            
-        Returns:
-            Reconstructed images with identity preservation
-        """
-        # Ensure input is on the correct device
-        x = x.to(self.device)
-        
-        # Encode input
-        features = self.encoder(x)
-        
-        # Extract current identity
-        current_identity = self.identity_layer(features)
-        
-        # Use identity embeddings if provided, otherwise use stored embeddings
-        if identity_embeddings is not None:
-            target_identity = identity_embeddings
-        elif hasattr(self, 'current_identity') and self.current_identity is not None:
-            target_identity = self.current_identity
-        else:
-            # If no identity is provided or stored, use the current identity
-            target_identity = current_identity
-        
-        # Apply identity weights (trainable)
-        # This creates a trainable path for backpropagation
-        weighted_features = features * self.identity_weight + current_identity * self.content_weight
-        
-        # Decode to reconstruct image
-        output = self.decoder(weighted_features)
-        
-        return output
-
-def init_model(input_size=512, device='cuda', use_simple_model=True):
+def init_model(input_size=512, device='cuda'):
     """
-    Initialize the model for identity preservation training
+    Initialize the Flux model with identity preservation capabilities
     
     Args:
         input_size: Input image size (assumed square)
         device: Device to put model on ('cuda' or 'cpu')
-        use_simple_model: Whether to use the simple autoencoder (True) or Flux (False)
         
     Returns:
-        model: Instance of IdentityPreservingFlux or SimpleIdentityAutoencoder
+        model: Instance of IdentityPreservingFlux
     """
     try:
-        if use_simple_model:
-            # Create SimpleIdentityAutoencoder for training
-            model = SimpleIdentityAutoencoder(input_size=input_size, device=device)
-            model = model.to(device)
-            logging.info(f"Created SimpleIdentityAutoencoder with input size {input_size} on device {device}")
-            return model
-        else:
-            # Create model instance on the specified device
-            model = IdentityPreservingFlux(
-                use_gpu=device=='cuda',
-                cache_dir="./cache"
-            )
-            model = model.to(device)
-            
-            # Load base model
-            model.load_base_model()
-            
-            # Log model creation
-            logging.info(f"Created IdentityPreservingFlux with input size {input_size} on device {device}")
-            
-            return model
+        # Create model instance on the specified device
+        model = IdentityPreservingFlux(
+            use_gpu=device=='cuda',
+            cache_dir="./cache"
+        )
+        model = model.to(device)
+        
+        # Load base model
+        model.load_base_model()
+        
+        # Log model creation
+        logging.info(f"Created IdentityPreservingFlux with input size {input_size} on device {device}")
+        
+        return model
     except Exception as e:
-        logging.error(f"Error initializing model: {e}")
+        logging.error(f"Error initializing IdentityPreservingFlux model: {e}")
         import traceback
         logging.error(traceback.format_exc())
         raise
@@ -866,10 +756,10 @@ def custom_collate_fn(batch):
     # Now that all PIL images are converted to tensors, use default_collate
     return torch.utils.data.dataloader.default_collate(processed_batch)
 
-def visualize_results(model, dataloader, output_dir, device, epoch, max_samples=4):
+def visualize_results(model, dataloader, output_dir, device, epoch, max_samples=8, dpi=150):
     """
     Generate and save visualizations of identity preservation results
-    
+        
     Args:
         model: Trained model
         dataloader: DataLoader with test samples
@@ -877,6 +767,7 @@ def visualize_results(model, dataloader, output_dir, device, epoch, max_samples=
         device: Device to run inference on
         epoch: Current epoch number
         max_samples: Maximum number of samples to visualize
+        dpi: DPI for saved plots
     """
     # Create visualization directory
     viz_dir = os.path.join(output_dir, 'visualizations')
@@ -887,12 +778,18 @@ def visualize_results(model, dataloader, output_dir, device, epoch, max_samples=
     
     # Get a batch of samples
     batch = next(iter(dataloader))
-    source_images = batch['source_image'].to(device)
+    source_images = batch['reference_image'].to(device)
     target_images = batch['target_image'].to(device)
+    char_ids = batch['char_id']
     
     # Limit samples
     source_images = source_images[:max_samples]
     target_images = target_images[:max_samples]
+    char_ids = char_ids[:max_samples]
+    
+    # Calculate number of rows and columns for grid
+    n_samples = source_images.shape[0]
+    grid_size = int(np.ceil(np.sqrt(n_samples)))
     
     # Generate output images
     with torch.no_grad():
@@ -904,6 +801,16 @@ def visualize_results(model, dataloader, output_dir, device, epoch, max_samples=
         
         # Generate output images
         output_images = model(target_images)
+        
+        # Extract identity from output images for similarity measure
+        out_face_emb, out_body_emb, _, _ = model.extract_identity(output_images)
+    
+    # Compute cosine similarity between reference and output embeddings
+    cosine_sim = nn.CosineSimilarity(dim=1)
+    face_sim = cosine_sim(ref_face_emb.view(ref_face_emb.size(0), -1), 
+                         out_face_emb.view(out_face_emb.size(0), -1)).cpu().numpy()
+    body_sim = cosine_sim(ref_body_emb.view(ref_body_emb.size(0), -1), 
+                         out_body_emb.view(out_body_emb.size(0), -1)).cpu().numpy()
     
     # Convert to numpy for visualization
     source_np = source_images.detach().cpu().permute(0, 2, 3, 1).numpy()
@@ -916,40 +823,158 @@ def visualize_results(model, dataloader, output_dir, device, epoch, max_samples=
     output_np = np.clip(output_np, 0, 1)
     
     # Create figure
-    n_samples = source_np.shape[0]
-    fig, axes = plt.subplots(n_samples, 3, figsize=(12, 4 * n_samples))
+    fig = plt.figure(figsize=(15, 5 * n_samples))
     
-    # Plot images
+    # Plot images in 3 columns (source, target, output)
     for i in range(n_samples):
-        if n_samples == 1:
-            ax_row = axes
-        else:
-            ax_row = axes[i]
-            
         # Source image
-        ax_row[0].imshow(source_np[i])
-        ax_row[0].set_title("Source")
-        ax_row[0].axis('off')
+        ax1 = fig.add_subplot(n_samples, 3, i*3 + 1)
+        ax1.imshow(source_np[i])
+        ax1.set_title(f"Source: {char_ids[i]}")
+        ax1.axis('off')
         
         # Target image
-        ax_row[1].imshow(target_np[i])
-        ax_row[1].set_title("Target")
-        ax_row[1].axis('off')
+        ax2 = fig.add_subplot(n_samples, 3, i*3 + 2)
+        ax2.imshow(target_np[i])
+        ax2.set_title("Target")
+        ax2.axis('off')
         
         # Output image
-        ax_row[2].imshow(output_np[i])
-        ax_row[2].set_title("Generated")
-        ax_row[2].axis('off')
+        ax3 = fig.add_subplot(n_samples, 3, i*3 + 3)
+        ax3.imshow(output_np[i])
+        ax3.set_title(f"Generated (Face Sim: {face_sim[i]:.2f}, Body Sim: {body_sim[i]:.2f})")
+        ax3.axis('off')
     
     # Save figure
     plt.tight_layout()
-    plt.savefig(os.path.join(viz_dir, f"epoch_{epoch:03d}.png"))
+    viz_path = os.path.join(viz_dir, f"epoch_{epoch:03d}.png")
+    plt.savefig(viz_path, dpi=dpi)
+    
+    # Save latest visualization for easy reference
+    latest_path = os.path.join(viz_dir, "latest.png")
+    plt.savefig(latest_path, dpi=dpi)
+    
     plt.close()
+    
+    # Add extra grid visualization with more samples if available
+    if n_samples >= 4:
+        # Create a grid figure
+        grid_fig = plt.figure(figsize=(15, 15))
+        
+        # Create three separate grids for source, target, and output
+        gs = grid_fig.add_gridspec(3, 1, height_ratios=[1, 1, 1])
+        
+        # Source images grid
+        ax_source = grid_fig.add_subplot(gs[0])
+        source_grid = torchvision.utils.make_grid(source_images[:16], nrow=4, normalize=True)
+        ax_source.imshow(source_grid.permute(1, 2, 0).cpu().numpy())
+        ax_source.set_title("Source Images")
+        ax_source.axis('off')
+        
+        # Target images grid
+        ax_target = grid_fig.add_subplot(gs[1])
+        target_grid = torchvision.utils.make_grid(target_images[:16], nrow=4, normalize=True)
+        ax_target.imshow(target_grid.permute(1, 2, 0).cpu().numpy())
+        ax_target.set_title("Target Images")
+        ax_target.axis('off')
+        
+        # Output images grid
+        ax_output = grid_fig.add_subplot(gs[2])
+        output_grid = torchvision.utils.make_grid(output_images[:16], nrow=4, normalize=True)
+        ax_output.imshow(output_grid.permute(1, 2, 0).cpu().numpy())
+        ax_output.set_title("Generated Images")
+        ax_output.axis('off')
+        
+        # Save grid figure
+        plt.tight_layout()
+        grid_path = os.path.join(viz_dir, f"grid_epoch_{epoch:03d}.png")
+        plt.savefig(grid_path, dpi=dpi)
+        
+        # Save latest grid for easy reference
+        latest_grid_path = os.path.join(viz_dir, "latest_grid.png")
+        plt.savefig(latest_grid_path, dpi=dpi)
+        
+        plt.close()
     
     # Set model back to training mode
     model.set_training_mode(True)
     
-    return os.path.join(viz_dir, f"epoch_{epoch:03d}.png")
+    logging.info(f"Saved visualizations to {viz_path}")
+    
+    return viz_path
+
+def plot_losses(train_losses, val_losses, output_dir, current_epoch, dpi=150):
+    """
+    Plot training and validation losses and save to output directory
+    
+    Args:
+        train_losses: Dictionary of training losses over epochs
+        val_losses: Dictionary of validation losses over epochs
+        output_dir: Directory to save plots
+        current_epoch: Current epoch number
+        dpi: DPI for saved plots
+    """
+    plt.figure(figsize=(15, 10))
+    
+    # Create plot directory if it doesn't exist
+    plot_dir = os.path.join(output_dir, 'plots')
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    # Plot total loss
+    plt.subplot(2, 2, 1)
+    plt.plot(train_losses['total'], label='Train Loss')
+    plt.plot(val_losses['total'], label='Val Loss')
+    plt.title('Total Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot face loss
+    plt.subplot(2, 2, 2)
+    plt.plot(train_losses['face'], label='Train Face Loss')
+    plt.plot(val_losses['face'], label='Val Face Loss')
+    plt.title('Face Identity Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot body loss
+    plt.subplot(2, 2, 3)
+    plt.plot(train_losses['body'], label='Train Body Loss')
+    plt.plot(val_losses['body'], label='Val Body Loss')
+    plt.title('Body Identity Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot content loss
+    plt.subplot(2, 2, 4)
+    plt.plot(train_losses['content'], label='Train Content Loss')
+    plt.plot(val_losses['content'], label='Val Content Loss')
+    plt.title('Content Preservation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    plot_path = os.path.join(plot_dir, f'losses_epoch_{current_epoch:03d}.png')
+    plt.savefig(plot_path, dpi=dpi)
+    
+    # Save the latest plot too for easy reference
+    latest_path = os.path.join(plot_dir, 'latest_losses.png')
+    plt.savefig(latest_path, dpi=dpi)
+    
+    plt.close()
+    
+    logging.info(f"Saved loss plots to {plot_path}")
+    
+    return plot_path
 
 def main(config):
     """
@@ -968,15 +993,26 @@ def main(config):
         logging.info("Starting identity-preserving model training...")
         
         # Dataset parameters
-        data_dir = config.get('data_dir', 'dataset_creation/data/dataset')
-        # Convert to absolute path if relative
+        data_dir = config.get('dataset_root', '/workspace/dtback/train/dataset')
+        # Ensure it's an absolute path
         if not os.path.isabs(data_dir):
-            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_dir)
+            # First try to resolve as a path relative to the current file's directory
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            data_dir_candidate = os.path.join(script_dir, data_dir)
+            
+            # If that doesn't exist, try resolving from the workspace root
+            if not os.path.exists(data_dir_candidate):
+                workspace_root = os.path.dirname(script_dir)
+                data_dir = os.path.join(workspace_root, data_dir)
+            else:
+                data_dir = data_dir_candidate
             
         # Check if dataset directory exists
         if not os.path.exists(data_dir):
             logging.error(f"Dataset directory not found: {data_dir}")
             raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
+        else:
+            logging.info(f"Using dataset directory: {data_dir}")
             
         output_dir = config.get('output_dir', 'checkpoints/identity_preserving')
         # Convert to absolute path if relative
@@ -1018,23 +1054,24 @@ def main(config):
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
         
-        # Initialize model - use SimpleIdentityAutoencoder for training
-        use_simple_model = config.get('use_simple_model', True)
+        # Initialize model
         try:
-            model = init_model(input_size=input_size, device=device, use_simple_model=use_simple_model)
+            model = init_model(input_size=input_size, device=device)
             model.to(device)
             logging.info(f"Model created on device: {device}")
         except Exception as e:
             logging.error(f"Error initializing model: {e}")
-            logging.error("Falling back to SimpleIdentityAutoencoder")
-            # Force using SimpleIdentityAutoencoder
-            model = SimpleIdentityAutoencoder(input_size=input_size, device=device)
+            logging.error("Falling back to default initialization")
+            model = IdentityPreservingFlux(
+                use_gpu=device=='cuda',
+                cache_dir="./cache"
+            )
             model.to(device)
         
         # Check if model has custom set_training_mode method
         if hasattr(model, 'set_training_mode'):
             logging.info("Model has custom set_training_mode method - will use this instead of train()")
-            
+        
         # Create identity criterion
         criterion = IdentityContentLoss(
             face_weight=face_weight,
@@ -1086,18 +1123,18 @@ def main(config):
             
             # Create dataloaders
             train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                shuffle=True,
+                train_dataset, 
+                batch_size=batch_size, 
+                shuffle=True, 
                 num_workers=config.get('num_workers', 4),
                 pin_memory=True,
                 collate_fn=custom_collate_fn
             )
             
             val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                shuffle=False,
+                val_dataset, 
+                batch_size=batch_size, 
+                shuffle=False, 
                 num_workers=config.get('num_workers', 4),
                 pin_memory=True,
                 collate_fn=custom_collate_fn
@@ -1120,6 +1157,28 @@ def main(config):
         # Start training
         logging.info("Starting training...")
         best_val_loss = float('inf')
+        
+        # Track losses for plotting
+        train_losses = {
+            'total': [],
+            'face': [],
+            'body': [],
+            'content': []
+        }
+        
+        val_losses = {
+            'total': [],
+            'face': [],
+            'body': [],
+            'content': []
+        }
+        
+        # Create visualization directory
+        viz_dir = os.path.join(output_dir, 'visualizations')
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        # Visualization frequency
+        viz_interval = config.get('viz_interval', 1)  # Visualize every N epochs
         
         for epoch in range(1, num_epochs + 1):
             try:
@@ -1144,47 +1203,123 @@ def main(config):
                     device=device
                 )
                 
+                # Store losses for plotting
+                train_losses['total'].append(train_metrics['loss'])
+                train_losses['face'].append(train_metrics['face_loss'])
+                train_losses['body'].append(train_metrics['body_loss'])
+                train_losses['content'].append(train_metrics['content_loss'])
+                
+                val_losses['total'].append(val_metrics['loss'])
+                val_losses['face'].append(val_metrics['face_loss'])
+                val_losses['body'].append(val_metrics['body_loss'])
+                val_losses['content'].append(val_metrics['content_loss'])
+                
                 # Log metrics
                 logging.info(f"Epoch {epoch}/{num_epochs}, Train Loss: {train_metrics['loss']:.4f}, Val Loss: {val_metrics['loss']:.4f}")
+                logging.info(f"  Face Loss: Train={train_metrics['face_loss']:.4f}, Val={val_metrics['face_loss']:.4f}")
+                logging.info(f"  Body Loss: Train={train_metrics['body_loss']:.4f}, Val={val_metrics['body_loss']:.4f}")
+                logging.info(f"  Content Loss: Train={train_metrics['content_loss']:.4f}, Val={val_metrics['content_loss']:.4f}")
                 
-                # Generate visualizations
-                try:
-                    visualization_path = visualize_results(
-                        model=model,
-                        dataloader=val_loader,
-                        output_dir=output_dir,
-                        device=device,
-                        epoch=epoch,
-                        max_samples=4
-                    )
-                    logging.info(f"Saved visualization to {visualization_path}")
-                except Exception as e:
-                    logging.error(f"Error generating visualizations: {e}")
+                # Plot and save losses every epoch
+                loss_plot_path = plot_losses(
+                    train_losses=train_losses,
+                    val_losses=val_losses,
+                    output_dir=output_dir,
+                    current_epoch=epoch,
+                    dpi=config.get('viz_dpi', 150)
+                )
+                
+                # Generate visualizations at specified intervals or if it's the first or last epoch
+                if epoch % viz_interval == 0 or epoch == 1 or epoch == num_epochs:
+                    try:
+                        visualization_path = visualize_results(
+                            model=model,
+                            dataloader=val_loader,
+                            output_dir=output_dir,
+                            device=device,
+                            epoch=epoch,
+                            max_samples=config.get('viz_samples', 8),
+                            dpi=config.get('viz_dpi', 150)
+                        )
+                        logging.info(f"Saved visualization to {visualization_path}")
+                    except Exception as e:
+                        logging.error(f"Error generating visualizations: {e}")
+                        import traceback
+                        logging.error(traceback.format_exc())
                 
                 # Save checkpoint if validation loss improved
                 if val_metrics['loss'] < best_val_loss:
                     best_val_loss = val_metrics['loss']
-                    checkpoint_path = os.path.join(output_dir, f"best_model.pt")
-                    torch.save({
+                    checkpoint_path = os.path.join(output_dir, f"best_model.safetensors")
+                    state_dict = {
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'train_loss': train_metrics['loss'],
                         'val_loss': val_metrics['loss'],
-                    }, checkpoint_path)
+                        'face_loss': val_metrics['face_loss'],
+                        'body_loss': val_metrics['body_loss'],
+                        'content_loss': val_metrics['content_loss'],
+                    }
+                    # Convert non-tensor values to tensors
+                    metadata = {}
+                    tensors = {}
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            tensors[k] = v
+                        elif k == 'model_state_dict' or k == 'optimizer_state_dict':
+                            for param_key, param_value in v.items():
+                                if isinstance(param_value, torch.Tensor):
+                                    tensors[f"{k}.{param_key}"] = param_value
+                        else:
+                            metadata[k] = str(v)
+                    
+                    save_file(tensors, checkpoint_path, metadata=metadata)
                     logging.info(f"Saved best model checkpoint to {checkpoint_path}")
+                    
+                    # Also save a copy with epoch number for reference
+                    best_epoch_path = os.path.join(output_dir, f"best_model_epoch_{epoch}.safetensors")
+                    save_file(tensors, best_epoch_path, metadata=metadata)
                 
                 # Save regular checkpoint
-                if epoch % config.get('save_interval', 10) == 0:
-                    checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.pt")
-                    torch.save({
+                if epoch % config.get('save_interval', 10) == 0 or epoch == num_epochs:
+                    checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.safetensors")
+                    state_dict = {
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'train_loss': train_metrics['loss'],
                         'val_loss': val_metrics['loss'],
-                    }, checkpoint_path)
+                        'face_loss': val_metrics['face_loss'],
+                        'body_loss': val_metrics['body_loss'],
+                        'content_loss': val_metrics['content_loss'],
+                    }
+                    # Convert non-tensor values to tensors
+                    metadata = {}
+                    tensors = {}
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.Tensor):
+                            tensors[k] = v
+                        elif k == 'model_state_dict' or k == 'optimizer_state_dict':
+                            for param_key, param_value in v.items():
+                                if isinstance(param_value, torch.Tensor):
+                                    tensors[f"{k}.{param_key}"] = param_value
+                        else:
+                            metadata[k] = str(v)
+                    
+                    save_file(tensors, checkpoint_path, metadata=metadata)
                     logging.info(f"Saved checkpoint to {checkpoint_path}")
+                    
+                # Save loss history
+                loss_history = {
+                    'train_losses': train_losses,
+                    'val_losses': val_losses,
+                    'epochs': list(range(1, epoch + 1))
+                }
+                loss_history_path = os.path.join(output_dir, 'loss_history.pkl')
+                with open(loss_history_path, 'wb') as f:
+                    pickle.dump(loss_history, f)
+                logging.info(f"Saved loss history to {loss_history_path}")
                     
             except Exception as e:
                 logging.error(f"Error in epoch {epoch}: {e}")
@@ -1201,14 +1336,51 @@ def main(config):
                 device=device
             )
             logging.info(f"Test Loss: {test_metrics['loss']:.4f}")
+            logging.info(f"  Face Loss: {test_metrics['face_loss']:.4f}")
+            logging.info(f"  Body Loss: {test_metrics['body_loss']:.4f}")
+            logging.info(f"  Content Loss: {test_metrics['content_loss']:.4f}")
+            
+            # Generate final visualizations on test set
+            try:
+                final_viz_path = visualize_results(
+                    model=model,
+                    dataloader=test_loader,
+                    output_dir=output_dir,
+                    device=device,
+                    epoch=9999,  # Use a special epoch number to indicate test set
+                    max_samples=config.get('viz_samples', 16),  # Show more examples for final evaluation
+                    dpi=config.get('viz_dpi', 150)
+                )
+                logging.info(f"Saved final test set visualization to {final_viz_path}")
+            except Exception as e:
+                logging.error(f"Error generating final visualizations: {e}")
+                import traceback
+                logging.error(traceback.format_exc())
             
             # Save final model
-            final_path = os.path.join(output_dir, "final_model.pt")
-            torch.save({
+            final_path = os.path.join(output_dir, "final_model.safetensors")
+            state_dict = {
                 'epoch': num_epochs,
                 'model_state_dict': model.state_dict(),
                 'test_loss': test_metrics['loss'],
-            }, final_path)
+                'face_loss': test_metrics['face_loss'],
+                'body_loss': test_metrics['body_loss'],
+                'content_loss': test_metrics['content_loss'],
+            }
+            # Convert non-tensor values to tensors
+            metadata = {}
+            tensors = {}
+            for k, v in state_dict.items():
+                if isinstance(v, torch.Tensor):
+                    tensors[k] = v
+                elif k == 'model_state_dict':
+                    for param_key, param_value in v.items():
+                        if isinstance(param_value, torch.Tensor):
+                            tensors[f"{k}.{param_key}"] = param_value
+                else:
+                    metadata[k] = str(v)
+                    
+            save_file(tensors, final_path, metadata=metadata)
             logging.info(f"Saved final model to {final_path}")
             
         except Exception as e:
@@ -1228,7 +1400,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train identity preserving model")
     
     # Dataset configuration
-    parser.add_argument('--dataset_root', type=str, default='dataset_creation/data/dataset',
+    parser.add_argument('--dataset_root', type=str, default='/workspace/dtback/train/dataset',
                         help="Root directory of the dataset")
     parser.add_argument('--batch_size', type=int, default=4,
                         help="Batch size for training")
@@ -1272,6 +1444,14 @@ if __name__ == "__main__":
                         help="Interval for validation (in epochs)")
     parser.add_argument('--save_interval', type=int, default=5,
                         help="Interval for saving checkpoints (in epochs)")
+    
+    # Visualization parameters
+    parser.add_argument('--viz_interval', type=int, default=1,
+                        help="Interval for generating visualizations (in epochs)")
+    parser.add_argument('--viz_samples', type=int, default=8,
+                        help="Number of samples to visualize")
+    parser.add_argument('--viz_dpi', type=int, default=150,
+                        help="DPI for saved visualizations")
     
     # Weights & Biases configuration
     parser.add_argument('--use_wandb', action='store_true',

@@ -9,7 +9,6 @@ cache_dir: "cache/identity_preserving"  # Relative to script location
 use_cache: true  # Enable caching of extracted features
 
 # Model parameters
-use_simple_model: true
 input_size: 512
 num_face_latents: 16
 num_body_latents: 16
@@ -18,7 +17,7 @@ body_injection_index: 9
 
 # Training parameters
 batch_size: 2  # Small batch size for testing
-num_epochs: 2  # Short test run
+num_epochs: 30  # Short test run
 learning_rate: 0.0001
 weight_decay: 0.00001
 face_weight: 1.0
@@ -39,7 +38,7 @@ num_inference_steps: 10
 
 # Output parameters
 output_dir: "checkpoints/identity_preserving"  # Relative to script location
-run_name: "identity_preserving_flux_test"
+run_name: "identity_preserving_flux"
 
 # Wandb parameters
 use_wandb: false  # Disabled by default for production training
