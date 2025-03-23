@@ -8,6 +8,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from torchvision import transforms
 from pathlib import Path
+from safetensors.torch import load_file
 
 # Import the architecture
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,7 +25,7 @@ def load_model(checkpoint_path, config=None):
     Load a trained identity preservation model
     
     Args:
-        checkpoint_path: Path to model checkpoint
+        checkpoint_path: Path to model checkpoint (.pth or .safetensors)
         config: Optional configuration dictionary
         
     Returns:
@@ -53,17 +54,49 @@ def load_model(checkpoint_path, config=None):
     # Load base model
     model.load_base_model()
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Check file extension to determine loading method
+    if checkpoint_path.endswith('.safetensors'):
+        # Load using safetensors
+        checkpoint = load_file(checkpoint_path, device=device)
+        
+        # Handle different state dict keys based on how it was saved
+        if 'model' in checkpoint:
+            model.load_state_dict(checkpoint['model'])
+        else:
+            model.load_state_dict(checkpoint)
+            
+        # Get metadata if available
+        epoch = checkpoint.get('epoch', 0)
+        train_metrics = checkpoint.get('train_metrics', {'loss': 0.0})
+        val_metrics = checkpoint.get('val_metrics', {'loss': 0.0})
+        
+        print(f"Model loaded from {checkpoint_path} (safetensors format)")
+        if 'epoch' in checkpoint:
+            print(f"Trained for {epoch} epochs")
+        if 'train_metrics' in checkpoint and 'val_metrics' in checkpoint:
+            train_loss = train_metrics.get('loss', 0.0)
+            val_loss = val_metrics.get('loss', 0.0)
+            print(f"Training loss: {train_loss:.4f}, Validation loss: {val_loss:.4f}")
+    else:
+        # Load using torch.load for .pth files
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Handle different state dict keys
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+            
+        # Print model info if available
+        if 'epoch' in checkpoint:
+            print(f"Model loaded from {checkpoint_path}")
+            print(f"Trained for {checkpoint['epoch']} epochs")
+        if 'train_loss' in checkpoint and 'val_loss' in checkpoint:
+            print(f"Training loss: {checkpoint['train_loss']:.4f}, Validation loss: {checkpoint['val_loss']:.4f}")
     
     # Move model to device
     model = model.to(device)
     model.eval()
-    
-    print(f"Model loaded from {checkpoint_path}")
-    print(f"Trained for {checkpoint['epoch']+1} epochs")
-    print(f"Training loss: {checkpoint['train_loss']:.4f}, Validation loss: {checkpoint['val_loss']:.4f}")
     
     return model
 

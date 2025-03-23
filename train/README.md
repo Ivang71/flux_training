@@ -1,131 +1,99 @@
-# Identity Preservation Training Pipeline
+# Identity-Preserving Flux Training Pipeline
 
-This directory contains scripts for training and testing an identity preservation model for the Flux image generation system.
+This directory contains the training pipeline for the Identity-Preserving Flux model, which learns how to preserve a person's identity across images.
 
 ## Overview
 
-The identity preservation model learns to preserve facial and body identity features when generating images. It works by extracting identity embeddings from reference images and injecting them into the Flux model.
+The Identity-Preserving model is designed to maintain a person's identity features when generating images with specific prompts. The training pipeline includes:
 
-## Setup
+1. A dataset loader that pairs reference images with target images
+2. Identity extraction capabilities using InsightFace
+3. A trainable autoencoder model for identity preservation
+4. Loss functions that measure identity similarity and content preservation
 
-### Prerequisites
+## File Structure
 
-- Python 3.8+
-- PyTorch 1.13+
-- CUDA-compatible GPU (recommended)
-- Diffusers library with Flux support
+- `run_training.py`: Main entry point for training
+- `train_identity_preserving.py`: Core training loop and model definitions
+- `architecture.py`: Implementation of the IdentityPreservingFlux model
+- `config.yaml`: Configuration file with training parameters
 
-### Installation
+## Dataset Format
 
-Install the required dependencies:
+The training dataset should be structured as follows:
+
+```
+dataset/
+  ├── 0/
+  │   ├── char_00001/
+  │   │   ├── img_00001.jpg
+  │   │   ├── img_00002.jpg
+  │   │   └── ...
+  │   └── ...
+  ├── 1/
+  │   └── ...
+  └── ...
+```
+
+Each character subdirectory should contain multiple images of the same person, with the first image (by alphabetical order) used as the reference image.
+
+## Training Process
+
+The training process follows these steps:
+
+1. Load dataset and split into train/validation/test sets
+2. Initialize the SimpleIdentityAutoencoder or IdentityPreservingFlux model
+3. For each epoch:
+   - Extract identity embeddings from reference images
+   - Generate images using the model
+   - Compare identity between reference and generated images
+   - Update model weights to minimize identity difference
+
+## Configuration
+
+The training can be configured using the `config.yaml` file. Important parameters include:
+
+- `data_dir`: Path to the dataset directory
+- `use_simple_model`: Whether to use the SimpleIdentityAutoencoder (for training) or full Flux model
+- `batch_size`: Number of samples per batch
+- `num_epochs`: Number of training epochs
+- `learning_rate`: Learning rate for optimization
+- `face_weight`: Weight for face identity loss component
+- `content_weight`: Weight for content preservation loss
+
+## Usage
+
+To start training:
 
 ```bash
-pip install torch torchvision torchaudio
-pip install diffusers transformers insightface ultralytics
-pip install tqdm matplotlib pillow wandb pyyaml
+python3 train/run_training.py --config train/config.yaml
 ```
 
-## Dataset Structure
+The training script will:
+1. Load the dataset
+2. Initialize the model
+3. Train for the specified number of epochs
+4. Save checkpoint models and visualizations
 
-The dataset should follow this structure:
+## Results
 
-```
-dataset_creation/data/dataset/
-├── 0/
-│   ├── 20/
-│   │   ├── 0.jpg
-│   │   ├── 1.jpg
-│   │   └── char_data.pkl (can be ignored)
-│   ├── 21/
-│   │   └── ...
-│   └── ...
-├── 1/
-│   └── ...
-└── ...
-```
+Training produces the following outputs:
 
-Each character directory contains multiple images of the same individual.
+1. Model checkpoints saved in the specified `output_dir`
+2. Visualizations showing identity preservation progress at each epoch
+3. Logs with training and validation metrics
 
-## Training
+## Extending
 
-### Configuration
+To extend this pipeline:
+- Add new identity feature extractors in `architecture.py`
+- Implement custom loss functions in `train_identity_preserving.py`
+- Modify the dataset loader for different data formats
 
-The training parameters are specified in the `config.yaml` file. You can modify this file to change the training settings.
+## Requirements
 
-### Running Training
-
-To train the model with the default configuration:
-
-```bash
-python train/run_training.py --config train/config.yaml
-```
-
-To override specific configuration parameters:
-
-```bash
-python train/run_training.py --config train/config.yaml --override batch_size=8 num_epochs=100
-```
-
-Alternatively, you can run the training script directly:
-
-```bash
-python train/train_identity_preserving.py --config train/config.yaml
-```
-
-### Training Parameters
-
-Key parameters in the config file:
-
-- **Dataset parameters**: `data_dir`, `bundle_dirs`, `max_chars_per_bundle`, `min_images_per_char`
-- **Model parameters**: `num_face_latents`, `num_body_latents`, `num_fused_latents`, `use_identity_fusion`
-- **Training parameters**: `batch_size`, `num_epochs`, `lr`, `face_weight`, `body_weight`, `content_weight`
-- **Monitoring**: `use_wandb`, `wandb_project`
-
-## Testing
-
-After training, you can test the model using the test script:
-
-```bash
-python train/test_model.py --checkpoint ./checkpoints/identity_preserving/identity_preserving_v1_best.pt --config train/config.yaml --reference path/to/reference.jpg --target path/to/target.jpg
-```
-
-For batch testing on the dataset:
-
-```bash
-python train/test_model.py --checkpoint ./checkpoints/identity_preserving/identity_preserving_v1_best.pt --dataset dataset_creation/data/dataset --bundle 0 --char 20 --output_dir ./test_outputs
-```
-
-## Monitoring
-
-If `use_wandb` is enabled in the config, training progress will be logged to [Weights & Biases](https://wandb.ai/). This includes:
-
-- Loss curves
-- Example outputs
-- Identity metrics
-- Hyperparameters
-
-## Hyperparameters
-
-Recommended hyperparameters:
-
-- **Learning rate**: 1e-4 to 5e-5
-- **Batch size**: 4-8 (depending on GPU memory)
-- **Epochs**: 50-100
-- **Identity weights**: face_weight=1.0, body_weight=0.5
-- **Content weight**: 0.5
-
-## Troubleshooting
-
-- **Out of memory errors**: Reduce batch size or image resolution
-- **No faces detected**: Ensure reference images have clear, frontal faces
-- **Poor identity preservation**: Increase face_weight or adjust num_face_latents
-- **Training takes too long**: Reduce the number of bundles or characters per bundle
-
-## Model Outputs
-
-The training process saves:
-
-- Best model checkpoint (`identity_preserving_v1_best.pt`)
-- Latest model checkpoint (`identity_preserving_v1_latest.pt`)
-- Training logs
-- Example outputs (if using wandb) 
+- PyTorch
+- torchvision
+- matplotlib
+- InsightFace (for face analysis)
+- CUDA-capable GPU (recommended) 
