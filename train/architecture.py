@@ -440,10 +440,6 @@ class IdentityPreservingFlux(nn.Module):
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
         self._unregister_hooks()
-        
-        if hasattr(self.base_model, 'dummy_param'):
-            print("Using dummy model - skipping hook registration")
-            return
 
         def face_hook(module, input_tensors, output):
             if not hasattr(self, 'current_face_tokens') or self.current_face_tokens is None:
@@ -493,10 +489,6 @@ class IdentityPreservingFlux(nn.Module):
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
         print("\nScanning Flux model structure...")
-        
-        if hasattr(self.base_model, 'dummy_param'):
-            print("Using dummy model - skipping structure scan")
-            return True
         
         if hasattr(self.base_model, 'transformer_blocks'):
             blocks = self.base_model.transformer_blocks
@@ -575,23 +567,8 @@ class IdentityPreservingFlux(nn.Module):
                 
             except Exception as e:
                 print(f"Error loading Flux model: {e}")
-                print(f"Using dummy model for training context only")
-                
-            print("Creating dummy transformer model for training")
-            class DummyModel(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.dummy_param = nn.Parameter(torch.zeros(1))
-                    
-                def __call__(self, *args, **kwargs):
-                    if len(args) > 0 and isinstance(args[0], torch.Tensor):
-                        return args[0]
-                    return None
-                    
-            self.base_model = DummyModel()
-            self.pipeline = None
-            print("Created dummy model for training context")
-            return self.base_model
+            
+            return None
         except Exception as e:
             print(f"Error in load_base_model: {e}")
             return None
