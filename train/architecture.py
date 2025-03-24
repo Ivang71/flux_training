@@ -15,10 +15,6 @@ import traceback
 from diffusers import FluxPipeline
 
 class PerceiverResampler(nn.Module):
-    """
-    Perceiver Resampler module that transforms variable-length input embeddings 
-    into a fixed number of latent tokens.
-    """
     def __init__(self, input_dim: int, latent_dim: int, num_latents: int, num_layers: int = 4, num_heads: int = 8, device: str = "cuda"):
         super().__init__()
         self.device = device
@@ -39,19 +35,14 @@ class PerceiverResampler(nn.Module):
         ])
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, D_input]
         batch_size = x.shape[0]
         
-        # Project input to latent dimension if needed
         if x.shape[-1] != self.latents.shape[-1]:
             x = self.input_proj(x)
         
-        # Initialize latents for each batch item
-        latents = self.latents.unsqueeze(0).expand(batch_size, -1, -1)  # [B, L, D_latent]
+        latents = self.latents.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Process through cross-attention layers
         for layer, norm in zip(self.layers, self.norm_layers):
-            # Cross-attention: latents attend to input
             attn_output, _ = layer(
                 query=latents,
                 key=x,
@@ -63,9 +54,6 @@ class PerceiverResampler(nn.Module):
 
 
 class IdentityInjectionLayer(nn.Module):
-    """
-    Cross-attention layer that injects identity information into UNet feature maps.
-    """
     def __init__(self, feature_dim: int, identity_dim: int, num_heads: int = 8):
         super().__init__()
         self.feature_dim = feature_dim
@@ -88,55 +76,39 @@ class IdentityInjectionLayer(nn.Module):
             nn.Linear(4 * feature_dim, feature_dim)
         )
         
-        # For storing attention maps for visualization
         self.last_attention_map = None
         
-        # Add conv layers for handling image-like inputs
         self.img_to_feature = nn.Conv2d(3, feature_dim, kernel_size=1, stride=1, padding=0)
         self.feature_to_img = nn.Conv2d(feature_dim, 3, kernel_size=1, stride=1, padding=0)
     
     def forward(self, hidden_states: torch.Tensor, identity_tokens: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
-        # Store original shape and dtype for later
         original_shape = hidden_states.shape
         original_dtype = hidden_states.dtype
         
-        # Check if input is image-like (B, C, H, W)
         is_image_like = len(original_shape) == 4 and original_shape[1] == 3
         
-        # Handle image-like inputs by converting to feature space first
         if is_image_like:
-            # Use spatial convolution to map 3 channels to feature_dim channels
-            # This is more memory efficient than reshaping to [B, H*W, 3] and using linear
-            hidden_states = self.img_to_feature(hidden_states)  # [B, feature_dim, H, W]
+            hidden_states = self.img_to_feature(hidden_states)
             B, C, H, W = hidden_states.shape
-            hidden_states = hidden_states.permute(0, 2, 3, 1)  # [B, H, W, feature_dim]
-            hidden_states = hidden_states.reshape(B, H*W, C)  # [B, H*W, feature_dim]
+            hidden_states = hidden_states.permute(0, 2, 3, 1)
+            hidden_states = hidden_states.reshape(B, H*W, C)
         
-        # For non-image tensors that don't match feature_dim
         elif hidden_states.shape[-1] != self.feature_dim:
-            # Use 1x1 convolution for more efficient projection
             if len(hidden_states.shape) == 3:
                 B, seq_len, C = hidden_states.shape
-                # Project to feature dimension with a linear layer
                 projection = nn.Linear(C, self.feature_dim, device=hidden_states.device)
                 hidden_states = projection(hidden_states)
         
-        # Project identity tokens if dimensions don't match
         if identity_tokens.shape[-1] != self.feature_dim:
             identity_tokens = self.identity_proj(identity_tokens)
         
-        # Make sure identity tokens are the same dtype as hidden states
         identity_tokens = identity_tokens.to(dtype=hidden_states.dtype)
         
-        # Apply layer normalization to hidden states
         norm_hidden = self.norm1(hidden_states)
         
-        # Apply attention with proper error handling and memory constraints
-        # Use chunked processing for large sequences to avoid OOM
-        chunk_size = 16384  # Process in chunks to avoid OOM
+        chunk_size = 16384
         num_chunks = (norm_hidden.shape[1] + chunk_size - 1) // chunk_size
         
-        # Process in chunks if sequence length is large
         if num_chunks > 1:
             chunks = []
             for i in range(num_chunks):
@@ -153,125 +125,78 @@ class IdentityInjectionLayer(nn.Module):
             
             attn_output = torch.cat(chunks, dim=1)
         else:
-            # Process in a single pass for small sequences
             attn_output, attn_weights = self.attn(
                 query=norm_hidden,
                 key=identity_tokens,
                 value=identity_tokens
             )
-            # Store attention map for visualization
             self.last_attention_map = attn_weights
         
-        # Apply identity strength control
         hidden_states = hidden_states + (attn_output * strength)
         
-        # Feed-forward block
         norm_hidden = self.norm2(hidden_states)
         ff_output = self.ff(norm_hidden)
         hidden_states = hidden_states + ff_output
         
-        # Convert back to original shape if needed
         if is_image_like:
             B, HW, C = hidden_states.shape
             H = W = int(np.sqrt(HW))
             hidden_states = hidden_states.reshape(B, H, W, C).permute(0, 3, 1, 2)
-            # Map feature dim back to 3 channels
             hidden_states = self.feature_to_img(hidden_states)
         
-        # Ensure we return the correct dtype
         return hidden_states.to(dtype=original_dtype)
 
 
 class IdentityFusionModule(nn.Module):
-    """
-    Module to fuse face and body identity features before injection.
-    """
     def __init__(self, face_dim=1024, body_dim=1024, hidden_dim=1024):
         super().__init__()
         self.face_dim = face_dim
         self.body_dim = body_dim
         self.hidden_dim = hidden_dim
         
-        # Self-attention for feature fusion
         self.attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=8,
             batch_first=True
         )
         
-        # Layer norm
         self.layer_norm = nn.LayerNorm(hidden_dim)
             
     def forward(self, face_tokens, body_tokens):
-        """
-        Fuse face and body tokens using self-attention.
-        
-        Args:
-            face_tokens: Tensor of shape [batch_size, num_face_tokens, dim]
-            body_tokens: Tensor of shape [batch_size, num_body_tokens, dim]
-            
-        Returns:
-            Tensor of shape [batch_size, num_face_tokens + num_body_tokens, dim]
-        """
-        # Normalize inputs - shape [B, num_tokens, feature_dim]
         face_tokens = self.layer_norm(face_tokens)
         body_tokens = self.layer_norm(body_tokens)
         
-        # Concatenate along sequence dimension
-        # Shape: [B, num_face_tokens + num_body_tokens, dim]
         combined = torch.cat([face_tokens, body_tokens], dim=1)
         
-        # Self-attention with same tensor for query, key, value
-        # Input shape: [B, seq_len, hidden_dim]
-        # Output shape: [B, seq_len, hidden_dim]
         attn_output, _ = self.attention(combined, combined, combined)
         
-        # Add residual connection
         output = combined + attn_output
         
         return output
 
 
 class FaceIdentityExtractor(nn.Module):
-    """
-    Module to extract face identity embeddings using InsightFace.
-    """
     def __init__(self, use_gpu: bool = True):
         super().__init__()
         self.face_analyzer = FaceAnalysis(
             providers=['CUDAExecutionProvider', 'CPUExecutionProvider'] if use_gpu else ['CPUExecutionProvider'],
-            name="buffalo_l"  # Using the higher quality model
+            name="buffalo_l"
         )
         self.face_analyzer.prepare(ctx_id=0 if use_gpu else -1, det_size=(640, 640))
     
     def forward(self, img: np.ndarray) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-        """
-        Extract face embedding from an image (only the primary/largest face).
-        
-        Args:
-            img: np.ndarray of shape [H, W, C] in RGB format
-        
-        Returns:
-            face_embedding: torch.Tensor of shape [1, 1, 512] (single face)
-            face_metadata: List with single face information dictionary or empty list
-        """
-        # Get the device from the model parameters
         device = next(self.parameters(), torch.tensor(0)).device
         
         faces = self.face_analyzer.get(img)
         
         if not faces:
-            # Return empty embedding if no face detected
             return torch.zeros(1, 1, 512, device=device), []
         
-        # Sort faces by area (largest first)
         faces.sort(key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]), reverse=True)
         
-        # Get embedding only for the largest face
         primary_face = faces[0]
-        face_embedding = torch.tensor(primary_face.embedding, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, 512]
+        face_embedding = torch.tensor(primary_face.embedding, device=device).unsqueeze(0).unsqueeze(0)
         
-        # Prepare face metadata for the primary face
         metadata = [{
             "bbox": primary_face.bbox,
             "kps": primary_face.kps,
@@ -285,29 +210,16 @@ class FaceIdentityExtractor(nn.Module):
 
 
 class YOLOBodyDetector(nn.Module):
-    """
-    Module to detect people using YOLOv8
-    """
     def __init__(self, model_size: str = "m", confidence: float = 0.25, cache_dir: Optional[str] = None):
-        """
-        Initialize the YOLOv8 detector.
-        
-        Args:
-            model_size: Size of YOLOv8 model ('n', 's', 'm', 'l', 'x')
-            confidence: Confidence threshold for detections
-            cache_dir: Directory to cache models
-        """
         super().__init__()
         self.model = None
         self.model_size = model_size
         self.confidence = confidence
-        # Use a local cache directory in the current directory
         self.cache_dir = cache_dir or os.path.join(".", "cache", "identity_preserving")
         os.makedirs(self.cache_dir, exist_ok=True)
         self._load_model()
     
     def _load_model(self):
-        """Lazy load YOLOv8 model to avoid import errors if not needed"""
         try:
             from ultralytics import YOLO
             model_path = f"yolov8{self.model_size}.pt"
@@ -317,32 +229,20 @@ class YOLOBodyDetector(nn.Module):
             self.model = None
     
     def detect_person(self, img: np.ndarray) -> List[torch.Tensor]:
-        """
-        Detect person bounding boxes using YOLOv8.
-        
-        Args:
-            img: np.ndarray of shape [H, W, C] in RGB format
-            
-        Returns:
-            List of tensors containing [x1, y1, x2, y2, score]
-        """
         if self.model is None:
             self._load_model()
             if self.model is None:
                 return []
         
-        # Run inference
         results = self.model(img, conf=self.confidence, verbose=False)
         
-        # Extract person detections (class 0 in COCO)
         person_boxes = []
         
         for result in results:
-            # Filter for person class (0)
             boxes = result.boxes
             for i, cls in enumerate(boxes.cls):
-                if int(cls) == 0:  # Person class
-                    box = boxes.xyxy[i].tolist()  # x1, y1, x2, y2
+                if int(cls) == 0:
+                    box = boxes.xyxy[i].tolist()
                     score = float(boxes.conf[i])
                     person_boxes.append(torch.tensor([*box, score]))
         
@@ -350,116 +250,73 @@ class YOLOBodyDetector(nn.Module):
 
 
 class BodyIdentityExtractor(nn.Module):
-    """
-    Module to extract body features using YOLOv8 for detection and DINOv2 for features.
-    """
     def __init__(self, cache_dir: Optional[str] = None, use_gpu: bool = True, yolo_confidence: float = 0.25):
         super().__init__()
-        # Use a local cache directory in the current directory
         self.cache_dir = cache_dir or os.path.join(".", "cache", "identity_preserving")
         os.makedirs(self.cache_dir, exist_ok=True)
 
         self.detector = YOLOBodyDetector(confidence=yolo_confidence, cache_dir=self.cache_dir)
         
-        # Load DINOv2 for feature extraction
         self.processor = AutoProcessor.from_pretrained("facebook/dinov2-large")
         self.model = AutoModel.from_pretrained("facebook/dinov2-large")
         
-        # Move to GPU if available and requested
         if use_gpu and torch.cuda.is_available():
             self.model = self.model.cuda()
             
-        # Flag for caching
         self.use_cached = False
         self.cached_embeddings = {}
     
     def enable_caching(self, enabled: bool = True):
-        """Enable or disable caching of embeddings"""
         self.use_cached = enabled
         if not enabled:
             self.cached_embeddings = {}
     
     def extract_features(self, img: np.ndarray, box: torch.Tensor) -> torch.Tensor:
-        """
-        Extract body features using DINOv2.
-        
-        Args:
-            img: np.ndarray of shape [H, W, C] in RGB format
-            box: torch.Tensor containing [x1, y1, x2, y2, score]
-            
-        Returns:
-            features: torch.Tensor of shape [1, 1024]
-        """
-        # Get the device from the model parameters
         device = self.model.device
         
         H, W = img.shape[:2]
         x1, y1, x2, y2 = [max(0, int(coord)) for coord in box[:4]]
         
-        # Crop the image
         cropped_img = img[y1:y2, x1:x2]
-        if cropped_img.size == 0:  # If the crop is empty
+        if cropped_img.size == 0:
             return torch.zeros(1, 1024, device=device)
         
-        # Check cache if enabled
         if self.use_cached:
-            # Simple hash of crop content
             crop_hash = hash(cropped_img.tobytes())
             if crop_hash in self.cached_embeddings:
-                # Ensure cached result is on the correct device
                 return self.cached_embeddings[crop_hash].to(device)
         
-        # Preprocess the image
         inputs = self.processor(images=cropped_img, return_tensors="pt")
         
-        # Move to same device as model
         inputs = {k: v.to(device) for k, v in inputs.items()}
         
-        # Extract features
         with torch.no_grad():
             outputs = self.model(**inputs)
-            # Get CLS token features
-            features = outputs.last_hidden_state[:, 0]  # [1, 1024]
+            features = outputs.last_hidden_state[:, 0]
         
-        # Cache the result if enabled
         if self.use_cached:
             self.cached_embeddings[crop_hash] = features.detach().clone()
         
         return features
     
     def forward(self, img: np.ndarray) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        Extract body embedding from an image (only the primary/largest person).
-        
-        Args:
-            img: np.ndarray of shape [H, W, C] in RGB format
-            
-        Returns:
-            body_embedding: torch.Tensor of shape [1, 1, 1024] (single person)
-            body_box: List with single tensor containing [x1, y1, x2, y2, score] or empty list
-        """
-        # Get the device from the model parameters
         device = self.model.device
         
         start_time = time.time()
         
-        # Detect persons
         boxes = self.detector.detect_person(img)
         
         detect_time = time.time()
         print(f"Person detection took: {detect_time - start_time:.2f}s")
         
         if not boxes:
-            # Return empty embedding if no person detected
             return torch.zeros(1, 1, 1024, device=device), []
         
-        # Sort boxes by area (largest first) if there are multiple detections
         if len(boxes) > 1:
             boxes.sort(key=lambda box: (box[2] - box[0]) * (box[3] - box[1]), reverse=True)
         
-        # Extract features only for the largest person
         primary_box = boxes[0]
-        body_embedding = self.extract_features(img, primary_box).unsqueeze(0)  # [1, 1, 1024]
+        body_embedding = self.extract_features(img, primary_box).unsqueeze(0)
         
         feature_time = time.time()
         print(f"Feature extraction took: {feature_time - detect_time:.2f}s")
@@ -468,11 +325,6 @@ class BodyIdentityExtractor(nn.Module):
 
 
 class IdentityPreservingFlux(nn.Module):
-    """
-    Identity-preserving system for Flux.1.
-    
-    Based on the actual Flux.1 architecture as shown in the diagram.
-    """
     def __init__(
         self,
         face_embedding_dim: int = 512,
@@ -480,8 +332,8 @@ class IdentityPreservingFlux(nn.Module):
         num_face_latents: int = 16,
         num_body_latents: int = 16,
         num_fused_latents: int = 32,
-        face_injection_index: int = 18,  # Near the end of the SingleStream blocks
-        body_injection_index: int = 10,  # Earlier in the DoubleStream blocks
+        face_injection_index: int = 18,
+        body_injection_index: int = 10,
         use_gpu: bool = True,
         cache_dir: Optional[str] = None,
         use_identity_fusion: bool = True,
@@ -489,7 +341,6 @@ class IdentityPreservingFlux(nn.Module):
     ):
         super().__init__()
         
-        # Initialize identity extractors
         self.face_extractor = FaceIdentityExtractor(use_gpu=use_gpu)
         self.body_extractor = BodyIdentityExtractor(
             cache_dir=cache_dir, 
@@ -497,14 +348,12 @@ class IdentityPreservingFlux(nn.Module):
             yolo_confidence=yolo_confidence
         )
         
-        # Set up dtype and device for model loading
         self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         self.device_map = "auto" if torch.cuda.is_available() else None
         
-        # Perceiver Resampler modules for identity embeddings
         self.face_perceiver = PerceiverResampler(
             input_dim=face_embedding_dim,
-            latent_dim=1024,  # Using 1024 as the standard dimension for Flux.1
+            latent_dim=1024,
             num_latents=num_face_latents
         )
         
@@ -514,18 +363,15 @@ class IdentityPreservingFlux(nn.Module):
             num_latents=num_body_latents
         )
         
-        # Identity fusion module (new)
         self.use_identity_fusion = use_identity_fusion
         if use_identity_fusion:
             self.identity_fusion = IdentityFusionModule(face_dim=1024, body_dim=1024)
-            # Additional perceiver for fused tokens
             self.fused_perceiver = PerceiverResampler(
                 input_dim=1024,
                 latent_dim=1024,
                 num_latents=num_fused_latents
             )
         
-        # Identity injection layers
         self.face_injection = IdentityInjectionLayer(
             feature_dim=1024,
             identity_dim=1024
@@ -536,36 +382,20 @@ class IdentityPreservingFlux(nn.Module):
             identity_dim=1024
         )
         
-        # Indices for where to inject identity information
         self.face_injection_index = face_injection_index
         self.body_injection_index = body_injection_index
         
-        # Will store base model reference when loaded
         self.base_model = None
         
-        # Initialize hooks dict to properly handle unregistering
         self.hooks = {}
         
-        # Identity strength control
         self.face_strength = 1.0
         self.body_strength = 1.0
         
-        # Training mode flag (to avoid collision with YOLO train method)
         self.training_mode = True
     
     def set_training_mode(self, mode=True):
-        """
-        Set the module in training or evaluation mode.
-        This method overrides nn.Module.train() to avoid conflicts with YOLO.
-        
-        Args:
-            mode: Whether to set training mode (True) or evaluation mode (False)
-        
-        Returns:
-            self
-        """
         self.training_mode = mode
-        # Apply the mode to all submodules except those with their own train method
         for module in self.children():
             if not hasattr(module, 'train') or not callable(module.train) or isinstance(module, nn.Module):
                 if hasattr(module, 'training'):
@@ -574,55 +404,33 @@ class IdentityPreservingFlux(nn.Module):
         return self
         
     def train(self, mode=True):
-        """
-        Override the train method to use our custom set_training_mode
-        to avoid collisions with YOLO's train method.
-        """
         return self.set_training_mode(mode)
     
     def eval(self):
-        """
-        Override the eval method to use our custom set_training_mode.
-        """
         return self.set_training_mode(False)
     
     def set_identity_strength(self, face_strength: float = 1.0, body_strength: float = 1.0):
-        """Set the strength of identity preservation (0.0-1.0)"""
         self.face_strength = max(0.0, min(1.0, face_strength))
         self.body_strength = max(0.0, min(1.0, body_strength))
     
     def _get_flux_module_by_index(self, idx: int) -> nn.Module:
-        """
-        Get the appropriate module from Flux.1 by index.
-        
-        Based on the architecture diagram:
-        - 0-18: 19 DoubleStream blocks (N = 19)
-        - 19-56: 38 SingleStream blocks (M = 38)
-        """
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
-        # Access blocks directly from the model's layers for compatibility
-        # with different versions of the Flux model
         try:
-            # For newer versions of Flux using transformer blocks
             if hasattr(self.base_model, 'transformer_blocks'):
                 return self.base_model.transformer_blocks[idx]
-            # For versions with separate double_stream and single_stream blocks
             elif hasattr(self.base_model, 'double_stream_blocks') and idx < 19:
                 return self.base_model.double_stream_blocks[idx]
             elif hasattr(self.base_model, 'single_stream_blocks') and idx >= 19 and idx < 57:
                 return self.base_model.single_stream_blocks[idx - 19]
-            # For models with a flat list of blocks
             elif hasattr(self.base_model, 'blocks'):
                 return self.base_model.blocks[idx]
-            # For models with layers attribute
             elif hasattr(self.base_model, 'layers'):
                 return self.base_model.layers[idx]
             else:
                 print(f"WARNING: Could not find appropriate blocks in the model structure.")
                 print(f"Available attributes: {dir(self.base_model)}")
-                # Return the model itself as fallback
                 return self.base_model
         except (IndexError, AttributeError) as e:
             print(f"Error accessing model layer at index {idx}: {e}")
@@ -630,28 +438,21 @@ class IdentityPreservingFlux(nn.Module):
             return self.base_model
     
     def _register_hooks(self):
-        """Register forward hooks for identity injection"""
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
-        # Unregister existing hooks
         self._unregister_hooks()
         
-        # Check if this is a dummy model for training
         if hasattr(self.base_model, 'dummy_param'):
             print("Using dummy model - skipping hook registration")
             return
 
-        # Define hook functions for face and body identity injection
         def face_hook(module, input_tensors, output):
-            # Skip if no identity tokens or not in forward pass
             if not hasattr(self, 'current_face_tokens') or self.current_face_tokens is None:
                 return output
             
-            # Get the tensor to modify
             hidden_states = output
             
-            # Apply face injection with configured strength
             if self.face_strength > 0:
                 hidden_states = self.face_injection(
                     hidden_states=hidden_states,
@@ -662,14 +463,11 @@ class IdentityPreservingFlux(nn.Module):
             return hidden_states
 
         def body_hook(module, input_tensors, output):
-            # Skip if no identity tokens or not in forward pass
             if not hasattr(self, 'current_body_tokens') or self.current_body_tokens is None:
                 return output
             
-            # Get the tensor to modify
             hidden_states = output
             
-            # Apply body injection with configured strength
             if self.body_strength > 0:
                 hidden_states = self.body_injection(
                     hidden_states=hidden_states,
@@ -679,7 +477,6 @@ class IdentityPreservingFlux(nn.Module):
             
             return hidden_states
         
-        # Register the hooks
         try:
             self.hooks['face'] = self._get_flux_module_by_index(self.face_injection_index).register_forward_hook(face_hook)
             self.hooks['body'] = self._get_flux_module_by_index(self.body_injection_index).register_forward_hook(body_hook)
@@ -689,31 +486,26 @@ class IdentityPreservingFlux(nn.Module):
             print("Identity injection may not work properly")
     
     def _unregister_hooks(self):
-        """Unregister all hooks"""
         for hook_name, hook in self.hooks.items():
             hook.remove()
         self.hooks = {}
     
     def _scan_model_structure(self):
-        """Scan the model structure to identify appropriate injection points"""
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
         print("\nScanning Flux model structure...")
         
-        # Check if this is a dummy model for training
         if hasattr(self.base_model, 'dummy_param'):
             print("Using dummy model - skipping structure scan")
             return True
         
-        # Check for specific Flux model architecture components
         if hasattr(self.base_model, 'transformer_blocks'):
             blocks = self.base_model.transformer_blocks
             print(f"Found transformer_blocks: {len(blocks)} blocks")
-            # Use appropriate indices for different points in the model
             total_blocks = len(blocks)
-            self.face_injection_index = int(total_blocks * 0.9)  # Face near the end (90%)
-            self.body_injection_index = int(total_blocks * 0.5)  # Body in the middle (50%)
+            self.face_injection_index = int(total_blocks * 0.9)
+            self.body_injection_index = int(total_blocks * 0.5)
             print(f"Set face_injection_index={self.face_injection_index}, body_injection_index={self.body_injection_index}")
             return True
         
@@ -735,7 +527,6 @@ class IdentityPreservingFlux(nn.Module):
             print(f"Set face_injection_index={self.face_injection_index}, body_injection_index={self.body_injection_index}")
             return True
         
-        # If we have separate streams (original architecture)
         found_structure = False
         if hasattr(self.base_model, 'double_stream_blocks'):
             double_blocks = self.base_model.double_stream_blocks
@@ -751,27 +542,15 @@ class IdentityPreservingFlux(nn.Module):
             print(f"Original architecture detected. Using face_injection_index={self.face_injection_index}, body_injection_index={self.body_injection_index}")
             return True
         
-        # If we couldn't identify the structure
         print("WARNING: Could not identify model structure.")
         print(f"Model attributes: {dir(self.base_model)}")
         print("Using default injection indices, but hooks may not work properly.")
         return False
         
     def load_base_model(self, base_model=None):
-        """
-        Load the base Flux model or use provided model.
-        
-        Args:
-            base_model: Optional pre-loaded FluxModel instance
-        
-        Returns:
-            The loaded base model
-        """
         if base_model is not None:
             self.base_model = base_model
-            # Scan model structure to determine injection points
             self._scan_model_structure()
-            # Register hooks based on the determined structure
             self._register_hooks()
             return self.base_model
             
@@ -779,20 +558,15 @@ class IdentityPreservingFlux(nn.Module):
             print(f"Loading Flux model with torch_dtype={self.torch_dtype}")
             
             try:
-                # Use FluxPipeline for proper loading
                 pipe = FluxPipeline.from_pretrained(
                     "black-forest-labs/FLUX.1-dev",
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 ).to("cuda" if torch.cuda.is_available() else "cpu")
                 
-                # Extract the transformer model
                 self.base_model = pipe.transformer
-                # Scan model structure to determine injection points
                 self._scan_model_structure()
-                # Register hooks based on the determined structure
                 self._register_hooks()
                 
-                # Store the pipeline for future use
                 self.pipeline = pipe
                 
                 print("Successfully loaded Flux model and pipeline")
@@ -805,7 +579,6 @@ class IdentityPreservingFlux(nn.Module):
                 print(f"Error loading Flux model: {e}")
                 print(f"Using dummy model for training context only")
                 
-            # For training only - create a dummy model
             print("Creating dummy transformer model for training")
             class DummyModel(nn.Module):
                 def __init__(self):
@@ -813,7 +586,6 @@ class IdentityPreservingFlux(nn.Module):
                     self.dummy_param = nn.Parameter(torch.zeros(1))
                     
                 def __call__(self, *args, **kwargs):
-                    # Just return input during training
                     if len(args) > 0 and isinstance(args[0], torch.Tensor):
                         return args[0]
                     return None
@@ -828,53 +600,30 @@ class IdentityPreservingFlux(nn.Module):
             return None
     
     def extract_identity(self, image):
-        """
-        Extract face and body identity from an image or batch of images.
-        
-        Args:
-            image: Either a PIL Image, numpy array, torch.Tensor, or path to an image file.
-                 For tensors, can handle a batch [B, C, H, W] or a single image [C, H, W].
-            
-        Returns:
-            face_embedding: torch.Tensor of shape [B, 1, 512] for batch or [1, 1, 512] for single image
-            body_embedding: torch.Tensor of shape [B, 1, 1024] for batch or [1, 1, 1024] for single image
-            face_metadata: List of dictionaries with face information (one per batch item or single)
-            body_box: List of tensors containing [x1, y1, x2, y2, score] (one per batch item or single)
-        """
-        # Get device from the model
         device = next(self.parameters()).device
         
-        # Special handling for tensor batch processing
         if isinstance(image, torch.Tensor) and image.dim() == 4 and image.shape[0] > 1:
             batch_size = image.shape[0]
             
-            # Initialize outputs
             all_face_embeddings = []
             all_body_embeddings = []
             all_face_metadata = []
             all_body_boxes = []
             
-            # Process each image in the batch
             for i in range(batch_size):
-                single_img = image[i:i+1]  # Keep batch dimension as [1, C, H, W]
+                single_img = image[i:i+1]
                 
-                # Convert tensor to numpy array for processing
                 single_img_np = single_img.squeeze(0).permute(1, 2, 0).cpu().numpy()
                 
-                # Handle normalization
                 if single_img_np.min() < 0 or single_img_np.max() > 1:
-                    # Denormalize if image was normalized with mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
                     mean = np.array([0.5, 0.5, 0.5])
                     std = np.array([0.5, 0.5, 0.5])
                     single_img_np = std * single_img_np + mean
                 
-                # Scale to [0, 255] and convert to uint8
                 single_img_np = np.clip(single_img_np * 255, 0, 255).astype(np.uint8)
                 
-                # Process the numpy array
                 face_emb, body_emb, face_meta, body_box = self._process_identity_from_numpy(single_img_np)
                 
-                # Move to same device as model
                 face_emb = face_emb.to(device)
                 body_emb = body_emb.to(device)
                 
@@ -883,38 +632,29 @@ class IdentityPreservingFlux(nn.Module):
                 all_face_metadata.append(face_meta)
                 all_body_boxes.append(body_box)
                 
-            # Combine results - ensure all tensors are on the same device
             face_embedding = torch.cat(all_face_embeddings, dim=0).to(device)
             body_embedding = torch.cat(all_body_embeddings, dim=0).to(device)
             
             return face_embedding, body_embedding, all_face_metadata, all_body_boxes
         
-        # Single image processing (including single tensor with batch dim = 1)
-        # Convert image to numpy array if needed
         if isinstance(image, str):
             from PIL import Image
             image = np.array(Image.open(image).convert('RGB'))
-        elif hasattr(image, 'mode'):  # PIL Image
+        elif hasattr(image, 'mode'):
             image = np.array(image.convert('RGB'))
-        elif isinstance(image, torch.Tensor):  # PyTorch tensor
-            # Handle single image with batch dimension
+        elif isinstance(image, torch.Tensor):
             if image.dim() == 4 and image.shape[0] == 1:
                 image = image.squeeze(0)
                 
-            # Convert tensor to numpy array
             image = image.permute(1, 2, 0).cpu().numpy()
             
-            # Handle normalization
             if image.min() < 0 or image.max() > 1:
-                # Denormalize if image was normalized with mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
                 mean = np.array([0.5, 0.5, 0.5])
                 std = np.array([0.5, 0.5, 0.5])
                 image = std * image + mean
                 
-            # Scale to [0, 255] and convert to uint8
             image = np.clip(image * 255, 0, 255).astype(np.uint8)
         
-        # Process and move results to the correct device
         face_embedding, body_embedding, face_metadata, body_box = self._process_identity_from_numpy(image)
         face_embedding = face_embedding.to(device)
         body_embedding = body_embedding.to(device) 
@@ -922,144 +662,82 @@ class IdentityPreservingFlux(nn.Module):
         return face_embedding, body_embedding, face_metadata, body_box
     
     def _process_identity_from_numpy(self, img_np):
-        """
-        Helper method to process numpy array image for identity extraction.
-        
-        Args:
-            img_np: Numpy array of shape [H, W, C] in RGB format
-            
-        Returns:
-            face_embedding: torch.Tensor of shape [1, 1, 512]
-            body_embedding: torch.Tensor of shape [1, 1, 1024]
-            face_metadata: Dict with face information or {}
-            body_box: Tensor containing [x1, y1, x2, y2, score] or None
-        """
-        # Get device from the model
         device = next(self.parameters()).device
         
-        # Extract face embeddings
         try:
             face_embeddings, face_metadata = self.face_extractor(img_np)
-            # Move embeddings to the correct device
             face_embeddings = face_embeddings.to(device)
         except Exception as e:
             print(f"Error in face extraction: {e}")
-            # Return zero tensor if face extraction fails
             face_embeddings = torch.zeros(1, 1, 512, device=device)
             face_metadata = []
         
-        # Extract body embeddings
         try:
             body_embeddings, body_boxes = self.body_extractor(img_np)
-            # Move embeddings to the correct device
             body_embeddings = body_embeddings.to(device)
         except Exception as e:
             print(f"Error in body extraction: {e}")
-            # Return zero tensor if body extraction fails
             body_embeddings = torch.zeros(1, 1, 1024, device=device)
             body_boxes = []
         
-        # Take only the first/primary face embedding
-        # If no faces detected, face_embeddings will already be a zero tensor of shape [1, 1, 512]
         face_embedding = face_embeddings[:, 0:1, :] if face_embeddings.size(1) > 0 else face_embeddings
         
-        # Take only the primary face metadata or empty dict if none found
         primary_face_metadata = face_metadata[0] if face_metadata else {}
         
-        # Take only the first/primary body embedding
-        # If no bodies detected, body_embeddings will already be a zero tensor of shape [1, 1, 1024]
         body_embedding = body_embeddings[:, 0:1, :] if body_embeddings.size(1) > 0 else body_embeddings
         
-        # Take only the primary body box or None if none found
         primary_body_box = body_boxes[0] if body_boxes else None
         
         return face_embedding, body_embedding, primary_face_metadata, primary_body_box
     
     def prepare_identity_tokens(self, face_embedding=None, body_embedding=None):
-        """
-        Prepare identity tokens from face and body embeddings.
-        
-        Args:
-            face_embedding: Tensor of shape [batch_size, 1, face_dim] (single face)
-            body_embedding: Tensor of shape [batch_size, 1, body_dim] (single body)
-        """
         device = next(self.parameters()).device
         face_tokens = None
         body_tokens = None
-        batch_size = 1  # Default batch size
+        batch_size = 1
         
-        # Process face embedding if provided
         if face_embedding is not None and face_embedding.ndim == 3:
-            # Ensure it's on the correct device
             face_embedding = face_embedding.to(device)
             
             batch_size = face_embedding.shape[0]
             face_tokens = self.face_perceiver(face_embedding)
             self.current_face_tokens = face_tokens
         
-        # Process body embedding if provided
         if body_embedding is not None and body_embedding.ndim == 3:
-            # Ensure it's on the correct device
             body_embedding = body_embedding.to(device)
             
-            if batch_size == 1:  # If not set by face, get from body
+            if batch_size == 1:
                 batch_size = body_embedding.shape[0]
             body_tokens = self.body_perceiver(body_embedding)
             self.current_body_tokens = body_tokens
             
-        # Apply fusion if both tokens are available and fusion is enabled
         if face_tokens is not None and body_tokens is not None and self.use_identity_fusion:
             fused_tokens = self.identity_fusion(face_tokens, body_tokens)
-            # Split back to maintain original token counts for each modality
             face_token_count = face_tokens.size(1)
             body_token_count = body_tokens.size(1)
             self.current_face_tokens = fused_tokens[:, :face_token_count, :]
             self.current_body_tokens = fused_tokens[:, face_token_count:, :]
     
     def __call__(self, input_images, prompt=None, negative_prompt=None, num_inference_steps=30, guidance_scale=7.5, **kwargs):
-        """
-        Process input images with the model, applying identity preservation.
-        
-        This method allows the model to be used directly in a training loop.
-        
-        Args:
-            input_images: Input images to process
-            prompt: Text prompt(s) to guide the generation
-            negative_prompt: Optional negative prompt(s)
-            num_inference_steps: Number of inference steps
-            guidance_scale: Guidance scale for classifier-free guidance
-            **kwargs: Additional arguments to pass to the pipeline
-            
-        Returns:
-            Processed images
-        """
         if self.training_mode:
-            # In training mode, don't run full pipeline but return the modified input
-            # This is specialized for identity preservation fine-tuning
             return input_images
         
-        # For inference mode, use the pipeline
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
         if not hasattr(self, 'pipeline'):
-            # Initialize pipeline if it doesn't exist
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             ).to("cuda" if torch.cuda.is_available() else "cpu")
             
-        # Process prompts
         if prompt is None:
-            # Default prompt if none provided
             if isinstance(input_images, torch.Tensor) and input_images.dim() > 3:
-                # Batch of images
                 batch_size = input_images.shape[0]
                 prompt = ["A high quality photo"] * batch_size
             else:
                 prompt = "A high quality photo"
         
-        # Process in pipeline
         with torch.no_grad():
             output = self.pipeline(
                 prompt=prompt,
@@ -1070,7 +748,6 @@ class IdentityPreservingFlux(nn.Module):
             )
             
             if hasattr(output, 'images'):
-                # Convert PIL images to tensor
                 output_tensor = []
                 for img in output.images:
                     img_tensor = transforms.ToTensor()(img).unsqueeze(0)
@@ -1080,16 +757,6 @@ class IdentityPreservingFlux(nn.Module):
             return output
     
     def visualize_attention(self, image_size=(512, 512)):
-        """
-        Visualize where the identity attention is focused.
-        
-        Args:
-            image_size: Size of the generated image (H, W)
-            
-        Returns:
-            fig: Matplotlib figure with attention visualizations
-        """
-        # Check if we have attention maps
         if not hasattr(self.face_injection, 'last_attention_map') or self.face_injection.last_attention_map is None:
             print("No face attention maps available. Run inference first.")
             return None
@@ -1098,30 +765,25 @@ class IdentityPreservingFlux(nn.Module):
             print("No body attention maps available. Run inference first.")
             return None
         
-        # Get attention maps
         face_attn = self.face_injection.last_attention_map.detach().cpu()
         body_attn = self.body_injection.last_attention_map.detach().cpu()
         
-        # Calculate image dimensions
         H, W = image_size
         seq_len = H * W
         
-        # Create figure
         fig, axes = plt.subplots(1, 2, figsize=(12, 6))
         
-        # Plot face attention
-        if face_attn.dim() == 3:  # [B, seq_len, num_heads*head_dim]
-            face_attn = face_attn.mean(0)  # Average over batch
-            face_attn = face_attn.mean(-1)  # Average over tokens
+        if face_attn.dim() == 3:
+            face_attn = face_attn.mean(0)
+            face_attn = face_attn.mean(-1)
             face_map = face_attn.reshape(H, W)
             axes[0].imshow(face_map, cmap='hot')
             axes[0].set_title("Face Identity Attention")
             axes[0].axis('off')
         
-        # Plot body attention
         if body_attn.dim() == 3:
-            body_attn = body_attn.mean(0)  # Average over batch
-            body_attn = body_attn.mean(-1)  # Average over tokens
+            body_attn = body_attn.mean(0)
+            body_attn = body_attn.mean(-1)
             body_map = body_attn.reshape(H, W)
             axes[1].imshow(body_map, cmap='hot')
             axes[1].set_title("Body Identity Attention")
@@ -1141,52 +803,29 @@ class IdentityPreservingFlux(nn.Module):
         body_strength: float = 1.0,
         **kwargs
     ):
-        """
-        Generate an image with identity preservation.
-        
-        Args:
-            prompt: Text prompt for image generation
-            reference_image: Image to extract identity from (PIL, numpy, or path)
-            negative_prompt: Optional negative prompt for generation
-            num_inference_steps: Number of diffusion steps
-            guidance_scale: Classifier-free guidance scale
-            face_strength: Strength of face identity preservation (0.0-1.0)
-            body_strength: Strength of body identity preservation (0.0-1.0)
-            **kwargs: Additional keyword arguments for the Flux.1 pipeline
-            
-        Returns:
-            PIL Image or images
-        """
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
-        # Set identity strength
         self.set_identity_strength(face_strength, body_strength)
         
-        # Extract identity from reference image - now returns single face/body
         face_embedding, body_embedding, face_metadata, body_box = self.extract_identity(reference_image)
         
-        # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             ).to("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Set up generator if not provided
         if 'generator' not in kwargs and torch.cuda.is_available():
             kwargs['generator'] = torch.Generator("cuda").manual_seed(int(time.time()))
         
-        # Set default height and width if not provided
         if 'height' not in kwargs:
             kwargs['height'] = 1024
         if 'width' not in kwargs:
             kwargs['width'] = 1024
         
-        # Prepare identity tokens
         self.prepare_identity_tokens(face_embedding, body_embedding)
         
-        # Generate with identity preservation
         output = self.pipeline(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -1208,61 +847,36 @@ class IdentityPreservingFlux(nn.Module):
         body_strength: float = 1.0,
         **kwargs
     ):
-        """
-        Generate multiple images with identity preservation using a batch approach.
-        
-        Args:
-            prompts: List of text prompts for image generation
-            reference_images: List of images to extract identity from
-            negative_prompts: Optional list of negative prompts
-            num_inference_steps: Number of diffusion steps
-            guidance_scale: Classifier-free guidance scale
-            face_strength: Strength of face identity preservation (0.0-1.0)
-            body_strength: Strength of body identity preservation (0.0-1.0)
-            **kwargs: Additional keyword arguments for the Flux.1 pipeline
-            
-        Returns:
-            List of PIL Images
-        """
         if len(prompts) != len(reference_images):
             raise ValueError(f"Number of prompts ({len(prompts)}) must match number of reference images ({len(reference_images)})")
             
-        # Set identity strength
         self.set_identity_strength(face_strength, body_strength)
         
-        # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             ).to("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Set default height and width if not provided
         if 'height' not in kwargs:
             kwargs['height'] = 1024
         if 'width' not in kwargs:
             kwargs['width'] = 1024
         
-        # Process one at a time for consistent handling
         all_images = []
         
         for i, (prompt, ref_img) in enumerate(zip(prompts, reference_images)):
-            # Set up generator with different seed for each image
             if torch.cuda.is_available():
                 current_generator = torch.Generator("cuda").manual_seed(int(time.time()) + i)
             else:
                 current_generator = torch.Generator().manual_seed(int(time.time()) + i)
             
-            # Extract identity - single face/body
             face_embedding, body_embedding, _, _ = self.extract_identity(ref_img)
             
-            # Prepare identity tokens
             self.prepare_identity_tokens(face_embedding, body_embedding)
             
-            # Get negative prompt if available
             neg_prompt = negative_prompts[i] if negative_prompts and i < len(negative_prompts) else None
             
-            # Generate with identity preservation
             output = self.pipeline(
                 prompt=prompt,
                 negative_prompt=neg_prompt,
@@ -1272,25 +886,14 @@ class IdentityPreservingFlux(nn.Module):
                 **kwargs
             )
             
-            # Collect image
             all_images.append(output.images[0])
         
         return all_images
     
     def add_lora(self, lora_path: str, weight_name: Optional[str] = None, adapter_name: str = "default", lora_scale: float = 0.8):
-        """
-        Load and apply a LoRA to the Flux.1 model.
-        
-        Args:
-            lora_path: Path to the LoRA file or HF repo
-            weight_name: Name of the weight file if lora_path is a directory
-            adapter_name: Name of the adapter for the LoRA
-            lora_scale: Scale factor for the LoRA weights
-        """
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
         
-        # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
@@ -1298,11 +901,9 @@ class IdentityPreservingFlux(nn.Module):
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             ).to("cuda" if torch.cuda.is_available() else "cpu")
             
-            # Move to GPU if needed
             if torch.cuda.is_available():
                 self.pipeline = self.pipeline.to("cuda")
         
-        # Apply LoRA directly to the pipeline
         try:
             self.pipeline.load_lora_weights(
                 lora_path, 
@@ -1310,11 +911,9 @@ class IdentityPreservingFlux(nn.Module):
                 adapter_name=adapter_name
             )
             
-            # Set current adapter with weight
             if hasattr(self.pipeline, "set_adapters"):
                 self.pipeline.set_adapters([adapter_name], [lora_scale])
                 
-            # Re-register hooks after loading LoRA
             self._register_hooks()
             
             print(f"Successfully loaded LoRA adapter '{adapter_name}' with scale {lora_scale}")
@@ -1324,21 +923,9 @@ class IdentityPreservingFlux(nn.Module):
             print("Make sure the LoRA is compatible with Flux.1")
     
     def add_multiple_loras(self, lora_configs: List[Dict[str, Any]]):
-        """
-        Load and apply multiple LoRAs to the Flux.1 model.
-        
-        Args:
-            lora_configs: List of dictionaries containing LoRA configurations.
-                         Each dict should have: 
-                         - 'path': Path to the LoRA file or HF repo
-                         - 'weight_name': (Optional) Name of the weight file if path is a directory
-                         - 'adapter_name': Name for this adapter
-                         - 'scale': Scale factor for this LoRA
-        """
         if self.base_model is None:
             raise ValueError("Base model not loaded. Call load_base_model first.")
             
-        # Create pipeline if not yet available
         if not hasattr(self, 'pipeline'):
             self.pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-dev",
@@ -1346,11 +933,9 @@ class IdentityPreservingFlux(nn.Module):
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             ).to("cuda" if torch.cuda.is_available() else "cpu")
             
-            # Move to GPU if needed
             if torch.cuda.is_available():
                 self.pipeline = self.pipeline.to("cuda")
         
-        # Load all LoRAs
         adapter_names = []
         adapter_scales = []
         
@@ -1375,37 +960,23 @@ class IdentityPreservingFlux(nn.Module):
             except Exception as e:
                 print(f"Error loading LoRA {config.get('adapter_name', 'unknown')}: {e}")
         
-        # Set all adapters with their weights
         if adapter_names and hasattr(self.pipeline, "set_adapters"):
             self.pipeline.set_adapters(adapter_names, adapter_scales)
             
-        # Re-register hooks after loading LoRAs
         self._register_hooks()
     
     def fuse_loras(self):
-        """
-        Fuse loaded LoRAs into the model weights for faster inference.
-        """
         if hasattr(self, 'pipeline') and hasattr(self.pipeline, "fuse_lora"):
             self.pipeline.fuse_lora()
             print("LoRAs have been fused into the model")
         else:
             print("No pipeline available or fuse_lora not supported")
         
-        # Re-register hooks after fusing
         self._register_hooks()
 
     def save_visualization(self, save_path: str, image_size=(512, 512)):
-        """
-        Save attention visualization to a file.
-        
-        Args:
-            save_path: Path to save visualization
-            image_size: Size of generated image
-        """
         fig = self.visualize_attention(image_size)
         if fig is not None:
-            # Ensure the directory exists
             save_dir = os.path.dirname(save_path)
             if save_dir:
                 os.makedirs(save_dir, exist_ok=True)
