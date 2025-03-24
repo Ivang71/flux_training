@@ -53,7 +53,7 @@ class PerceiverResampler(nn.Module):
 
 
 class IdentityInjectionLayer(nn.Module):
-    def __init__(self, feature_dim: int, identity_dim: int, num_heads: int = 8):
+    def __init__(self, feature_dim: int, identity_dim: int, num_heads: int = 8, input_dims: Optional[List[int]] = None):
         super().__init__()
         self.feature_dim = feature_dim
         self.identity_dim = identity_dim
@@ -79,6 +79,30 @@ class IdentityInjectionLayer(nn.Module):
         
         self.img_to_feature = nn.Conv2d(3, feature_dim, kernel_size=1, stride=1, padding=0)
         self.feature_to_img = nn.Conv2d(feature_dim, 3, kernel_size=1, stride=1, padding=0)
+        
+        self.input_projections = nn.ModuleDict()
+        
+        standard_dims = [768, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 4096, 5120]
+        
+        if input_dims is None:
+            input_dims = []
+        
+        all_dims = list(set(standard_dims + input_dims))
+        for dim in all_dims:
+            if dim != feature_dim:
+                self.input_projections[f"proj_{dim}"] = nn.Linear(dim, feature_dim)
+    
+    def add_projection_for_dim(self, input_dim: int):
+        if input_dim == self.feature_dim:
+            return False
+            
+        proj_key = f"proj_{input_dim}"
+        if proj_key in self.input_projections:
+            return False
+            
+        device = next(self.parameters()).device
+        self.input_projections[proj_key] = nn.Linear(input_dim, self.feature_dim).to(device)
+        return True
     
     def forward(self, hidden_states: torch.Tensor, identity_tokens: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
         original_shape = hidden_states.shape
@@ -95,8 +119,12 @@ class IdentityInjectionLayer(nn.Module):
         elif hidden_states.shape[-1] != self.feature_dim:
             if len(hidden_states.shape) == 3:
                 B, seq_len, C = hidden_states.shape
-                projection = nn.Linear(C, self.feature_dim, device=hidden_states.device)
-                hidden_states = projection(hidden_states)
+                proj_key = f"proj_{C}"
+                if proj_key in self.input_projections:
+                    hidden_states = self.input_projections[proj_key](hidden_states)
+                else:
+                    raise ValueError(f"No projection available for input dimension {C}. "
+                                     f"Please add {C} to input_dims when creating the IdentityInjectionLayer.")
         
         if identity_tokens.shape[-1] != self.feature_dim:
             identity_tokens = self.identity_proj(identity_tokens)
@@ -335,7 +363,8 @@ class IdentityPreservingFlux(nn.Module):
         use_gpu: bool = True,
         cache_dir: Optional[str] = None,
         use_identity_fusion: bool = True,
-        yolo_confidence: float = 0.25
+        yolo_confidence: float = 0.25,
+        input_dims: Optional[List[int]] = None
     ):
         super().__init__()
         
@@ -370,14 +399,20 @@ class IdentityPreservingFlux(nn.Module):
                 num_latents=num_fused_latents
             )
         
+        # Default input dimensions if not provided
+        if input_dims is None:
+            input_dims = [768, 1024, 1280, 2048]  # Common transformer dimensions
+        
         self.face_injection = IdentityInjectionLayer(
             feature_dim=1024,
-            identity_dim=1024
+            identity_dim=1024,
+            input_dims=input_dims
         )
         
         self.body_injection = IdentityInjectionLayer(
             feature_dim=1024,
-            identity_dim=1024
+            identity_dim=1024,
+            input_dims=input_dims
         )
         
         self.face_injection_index = face_injection_index
@@ -391,6 +426,10 @@ class IdentityPreservingFlux(nn.Module):
         self.body_strength = 1.0
         
         self.training_mode = True
+        
+        # Register buffers for identity tokens
+        self.register_buffer('current_face_tokens', None, persistent=False)
+        self.register_buffer('current_body_tokens', None, persistent=False)
     
     def set_training_mode(self, mode=True):
         self.training_mode = mode
@@ -542,6 +581,8 @@ class IdentityPreservingFlux(nn.Module):
             self.base_model = base_model
             self._scan_model_structure()
             self._register_hooks()
+            # Scan for dimensions in the model to add necessary projections
+            self.scan_model_for_dimensions()
             return self.base_model
             
         try:
@@ -556,6 +597,9 @@ class IdentityPreservingFlux(nn.Module):
                 self.base_model = pipe.transformer
                 self._scan_model_structure()
                 self._register_hooks()
+                
+                # Scan for dimensions in the model to add necessary projections
+                self.scan_model_for_dimensions()
                 
                 self.pipeline = pipe
                 
@@ -675,7 +719,11 @@ class IdentityPreservingFlux(nn.Module):
             
             batch_size = face_embedding.shape[0]
             face_tokens = self.face_perceiver(face_embedding)
-            self.current_face_tokens = face_tokens
+            # Create buffer if it doesn't exist
+            if self.current_face_tokens is None or self.current_face_tokens.shape != face_tokens.shape:
+                self.register_buffer('current_face_tokens', face_tokens, persistent=False)
+            else:
+                self.current_face_tokens.copy_(face_tokens)
         
         if body_embedding is not None and body_embedding.ndim == 3:
             body_embedding = body_embedding.to(device)
@@ -683,14 +731,19 @@ class IdentityPreservingFlux(nn.Module):
             if batch_size == 1:
                 batch_size = body_embedding.shape[0]
             body_tokens = self.body_perceiver(body_embedding)
-            self.current_body_tokens = body_tokens
+            # Create buffer if it doesn't exist
+            if self.current_body_tokens is None or self.current_body_tokens.shape != body_tokens.shape:
+                self.register_buffer('current_body_tokens', body_tokens, persistent=False)
+            else:
+                self.current_body_tokens.copy_(body_tokens)
             
         if face_tokens is not None and body_tokens is not None and self.use_identity_fusion:
             fused_tokens = self.identity_fusion(face_tokens, body_tokens)
             face_token_count = face_tokens.size(1)
             body_token_count = body_tokens.size(1)
-            self.current_face_tokens = fused_tokens[:, :face_token_count, :]
-            self.current_body_tokens = fused_tokens[:, face_token_count:, :]
+            # Update the buffers with fused tokens
+            self.current_face_tokens.copy_(fused_tokens[:, :face_token_count, :])
+            self.current_body_tokens.copy_(fused_tokens[:, face_token_count:, :])
     
     def __call__(self, input_images, prompt=None, negative_prompt=None, num_inference_steps=30, guidance_scale=7.5, **kwargs):
         if self.training_mode:
@@ -958,3 +1011,275 @@ class IdentityPreservingFlux(nn.Module):
             fig.savefig(save_path)
             plt.close(fig)
             print(f"Visualization saved to {save_path}")
+    
+    def verify_parameters(self):
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        modules_with_params = {}
+        for name, module in self.named_modules():
+            if list(module.parameters(recurse=False)):
+                param_count = sum(p.numel() for p in module.parameters(recurse=False))
+                modules_with_params[name] = param_count
+        
+        device_transfer_success = True
+        original_device = next(self.parameters()).device
+        
+        try:
+            cpu_model = self.to("cpu")
+            cpu_device = next(cpu_model.parameters()).device
+            device_transfer_success = str(cpu_device) == "cpu"
+            
+            self.to(original_device)
+        except Exception as e:
+            device_transfer_success = False
+            print(f"Failed to transfer model to CPU: {e}")
+        
+        buffers = {name: buffer.shape for name, buffer in self.named_buffers()}
+        
+        hooks_registered = len(self.hooks) > 0
+        
+        dynamic_modules = []
+        for name, module in self.named_modules():
+            if isinstance(module, IdentityInjectionLayer) and hasattr(module, 'input_projections'):
+                dynamic_keys = list(module.input_projections.keys())
+                if dynamic_keys:
+                    dynamic_modules.append(f"{name}: {dynamic_keys}")
+        
+        return {
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "modules_with_parameters": modules_with_params,
+            "device_transfer_successful": device_transfer_success,
+            "registered_buffers": buffers,
+            "hooks_registered": hooks_registered,
+            "dynamic_modules": dynamic_modules
+        }
+
+    def add_projection_for_dimension(self, input_dim: int) -> bool:
+        added = False
+        if hasattr(self, 'face_injection'):
+            added = self.face_injection.add_projection_for_dim(input_dim) or added
+            
+        if hasattr(self, 'body_injection'):
+            added = self.body_injection.add_projection_for_dim(input_dim) or added
+            
+        return added
+    
+    def scan_model_for_dimensions(self) -> List[int]:
+        if self.base_model is None:
+            print("Base model not loaded. Cannot scan for dimensions.")
+            return []
+            
+        found_dims = []
+        
+        def check_module_dims(module):
+            dims = []
+            for name, param in module.named_parameters():
+                if 'weight' in name and len(param.shape) >= 2:
+                    if param.shape[0] not in dims and param.shape[0] != 1024:
+                        dims.append(param.shape[0])
+                    if param.shape[1] not in dims and param.shape[1] != 1024:
+                        dims.append(param.shape[1])
+            return dims
+        
+        for name, module in self.base_model.named_modules():
+            dims = check_module_dims(module)
+            for dim in dims:
+                if dim > 64 and dim not in found_dims:
+                    found_dims.append(dim)
+                    self.add_projection_for_dimension(dim)
+        
+        print(f"Found and added support for {len(found_dims)} dimensions: {found_dims}")
+        return found_dims
+
+def test_model_device_transfer(model_class=IdentityPreservingFlux, **kwargs):
+    print("Testing model device transfer...")
+    
+    if not torch.cuda.is_available():
+        print("CUDA not available, testing CPU transfer only")
+        
+    model = model_class(**kwargs).to("cpu")
+    
+    initial_params = sum(p.numel() for p in model.parameters())
+    print(f"Initial parameter count: {initial_params}")
+    
+    buffer_count = sum(1 for _ in model.buffers())
+    print(f"Buffer count: {buffer_count}")
+    
+    all_params_on_cpu = all(p.device.type == "cpu" for p in model.parameters())
+    print(f"All parameters on CPU: {all_params_on_cpu}")
+    
+    results = {
+        "model_class": model_class.__name__,
+        "initial_params": initial_params,
+        "buffer_count": buffer_count,
+        "all_params_on_cpu": all_params_on_cpu,
+        "cuda_tests": {}
+    }
+    
+    if torch.cuda.is_available():
+        try:
+            model.to("cuda")
+            cuda_param_count = sum(p.numel() for p in model.parameters())
+            all_params_on_cuda = all(p.device.type == "cuda" for p in model.parameters())
+            cuda_buffer_count = sum(1 for _ in model.buffers())
+            
+            print(f"CUDA parameter count: {cuda_param_count}")
+            print(f"All parameters on CUDA: {all_params_on_cuda}")
+            print(f"CUDA buffer count: {cuda_buffer_count}")
+            
+            params_match = cuda_param_count == initial_params
+            buffers_match = cuda_buffer_count == buffer_count
+            
+            results["cuda_tests"] = {
+                "cuda_param_count": cuda_param_count,
+                "all_params_on_cuda": all_params_on_cuda,
+                "cuda_buffer_count": cuda_buffer_count,
+                "params_match": params_match,
+                "buffers_match": buffers_match
+            }
+            
+            model.to("cpu")
+            back_to_cpu_params = sum(p.numel() for p in model.parameters())
+            all_back_on_cpu = all(p.device.type == "cpu" for p in model.parameters())
+            
+            print(f"Back to CPU parameter count: {back_to_cpu_params}")
+            print(f"All parameters back on CPU: {all_back_on_cpu}")
+            
+            results["back_to_cpu"] = {
+                "back_to_cpu_params": back_to_cpu_params,
+                "all_back_on_cpu": all_back_on_cpu,
+                "params_match": back_to_cpu_params == initial_params
+            }
+            
+        except Exception as e:
+            print(f"Error during CUDA transfer: {e}")
+            results["cuda_tests"]["error"] = str(e)
+    
+    if hasattr(model, 'verify_parameters'):
+        verification_results = model.verify_parameters()
+        results["verification_results"] = verification_results
+    
+    try:
+        dummy_input = torch.randn(1, 3, 32, 32)
+        model.eval()
+        with torch.no_grad():
+            _ = model.extract_identity(dummy_input)
+        results["dummy_input_test"] = "passed"
+    except Exception as e:
+        print(f"Error during dummy input test: {e}")
+        results["dummy_input_test"] = f"failed: {str(e)}"
+    
+    print("Device transfer tests completed.")
+    return results
+
+def test_no_dynamic_instantiation():
+    print("Testing that no dynamic instantiation occurs in forward method...")
+    
+    model = IdentityPreservingFlux(input_dims=[512, 1024]).to("cpu")
+    
+    initial_params = sum(p.numel() for p in model.parameters())
+    print(f"Initial parameter count: {initial_params}")
+    
+    initial_projection_layers = {}
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            initial_projection_layers[name] = len(module.input_projections)
+    
+    print(f"Initial projection layers: {initial_projection_layers}")
+    
+    dummy_input = torch.randn(1, 3, 32, 32)
+    identity_tokens = torch.randn(1, 4, 1024)
+    
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            try:
+                _ = module.forward(dummy_input, identity_tokens)
+                print(f"Forward pass succeeded for {name} with image input")
+            except Exception as e:
+                print(f"Error in forward pass for {name} with image input: {e}")
+    
+    feature_input = torch.randn(1, 10, 1024)
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            try:
+                _ = module.forward(feature_input, identity_tokens)
+                print(f"Forward pass succeeded for {name} with 1024-dim features")
+            except Exception as e:
+                print(f"Error in forward pass for {name} with 1024-dim features: {e}")
+    
+    feature_input_512 = torch.randn(1, 10, 512)
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            try:
+                _ = module.forward(feature_input_512, identity_tokens)
+                print(f"Forward pass succeeded for {name} with 512-dim features")
+            except Exception as e:
+                print(f"Error in forward pass for {name} with 512-dim features: {e}")
+    
+    feature_input_768 = torch.randn(1, 10, 768)
+    expected_errors = {}
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            try:
+                _ = module.forward(feature_input_768, identity_tokens)
+                print(f"WARNING: Forward pass succeeded for {name} with unsupported 768-dim features")
+                expected_errors[name] = False
+            except ValueError as e:
+                print(f"Expected error for {name} with unsupported 768-dim features: {e}")
+                expected_errors[name] = True
+            except Exception as e:
+                print(f"Unexpected error type for {name}: {e}")
+                expected_errors[name] = False
+    
+    final_params = sum(p.numel() for p in model.parameters())
+    params_unchanged = initial_params == final_params
+    print(f"Parameters unchanged: {params_unchanged} ({initial_params} vs {final_params})")
+    
+    final_projection_layers = {}
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            final_projection_layers[name] = len(module.input_projections)
+    
+    projections_unchanged = initial_projection_layers == final_projection_layers
+    print(f"Projection layers unchanged: {projections_unchanged}")
+    print(f"Initial: {initial_projection_layers}")
+    print(f"Final: {final_projection_layers}")
+    
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            module.add_projection_for_dim(768)
+    
+    for name, module in model.named_modules():
+        if isinstance(module, IdentityInjectionLayer):
+            try:
+                _ = module.forward(feature_input_768, identity_tokens)
+                print(f"Forward pass now succeeds for {name} with 768-dim features after adding projection")
+            except Exception as e:
+                print(f"Error in forward pass for {name} with 768-dim features after adding projection: {e}")
+    
+    added_params = sum(p.numel() for p in model.parameters())
+    params_increased = added_params > final_params
+    print(f"Parameters increased after adding projection: {params_increased} ({final_params} -> {added_params})")
+    
+    return {
+        "initial_params": initial_params,
+        "final_params": final_params,
+        "added_params": added_params,
+        "params_unchanged_during_forward": params_unchanged,
+        "projections_unchanged_during_forward": projections_unchanged,
+        "expected_errors_raised": expected_errors,
+        "params_increased_after_adding_projection": params_increased
+    }
+
+if __name__ == "__main__":
+    # Test that no dynamic instantiation happens
+    no_dynamic_instantiation_results = test_no_dynamic_instantiation()
+    print("\nNo Dynamic Instantiation Test Results:", no_dynamic_instantiation_results)
+    
+    # Original device transfer test
+    test_results = test_model_device_transfer(
+        input_dims=[768, 1024, 1280, 2048]
+    )
+    print("\nDevice Transfer Test Results:", test_results)
