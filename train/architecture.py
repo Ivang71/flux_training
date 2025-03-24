@@ -10,7 +10,6 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import time
 from torchvision import transforms
-import traceback
 
 from diffusers import FluxPipeline
 
@@ -225,7 +224,6 @@ class YOLOBodyDetector(nn.Module):
             model_path = f"yolov8{self.model_size}.pt"
             self.model = YOLO(model_path)
         except ImportError:
-            print("YOLOv8 not installed. Please install with: pip install ultralytics")
             self.model = None
     
     def detect_person(self, img: np.ndarray) -> List[torch.Tensor]:
@@ -596,7 +594,6 @@ class IdentityPreservingFlux(nn.Module):
             return self.base_model
         except Exception as e:
             print(f"Error in load_base_model: {e}")
-            print(traceback.format_exc())
             return None
     
     def extract_identity(self, image):

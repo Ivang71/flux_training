@@ -4,17 +4,8 @@ import torch
 from safetensors.torch import save_file
 import glob
 from tqdm import tqdm
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('convert_to_safetensors')
 
 def convert_checkpoint(input_path, output_path):
-    logger.info(f"Converting {input_path} to {output_path}")
-    
     checkpoint = torch.load(input_path, map_location='cpu')
     
     metadata = {}
@@ -31,11 +22,9 @@ def convert_checkpoint(input_path, output_path):
             metadata[k] = str(v)
     
     save_file(tensors, output_path, metadata=metadata)
-    logger.info(f"Successfully converted to {output_path}")
     
     original_size = os.path.getsize(input_path) / (1024 * 1024)
     converted_size = os.path.getsize(output_path) / (1024 * 1024)
-    logger.info(f"Original size: {original_size:.2f} MB, Converted size: {converted_size:.2f} MB")
 
 def main():
     parser = argparse.ArgumentParser(description='Convert PyTorch checkpoints to safetensors format')
@@ -65,10 +54,7 @@ def main():
             pt_files += glob.glob(os.path.join(args.input, '*.pth'))
         
         if not pt_files:
-            logger.warning(f"No .pt or .pth files found in {args.input}")
             return
-        
-        logger.info(f"Found {len(pt_files)} PyTorch checkpoint files to convert")
         
         for pt_file in tqdm(pt_files):
             rel_path = os.path.relpath(pt_file, args.input)
@@ -78,7 +64,6 @@ def main():
             
             convert_checkpoint(pt_file, output_path)
     else:
-        logger.error(f"Input path {args.input} does not exist")
         return
 
 if __name__ == "__main__":

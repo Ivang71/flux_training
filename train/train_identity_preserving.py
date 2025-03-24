@@ -1,11 +1,9 @@
 import os
 import sys
 import time
-import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import traceback
 import warnings
 import random
 import pickle
@@ -35,24 +33,12 @@ except ImportError:
     try:
         from architecture import IdentityPreservingFlux
     except ImportError:
-        print("Error: Could not import IdentityPreservingFlux. Make sure the architecture.py file is accessible.")
         sys.exit(1)
 
 try:
     import wandb
 except ImportError:
-    print("Warning: wandb not installed. Logging will be disabled.")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('identity_training.log'),
-        logging.StreamHandler()
-    ]
-)
-
-logger = logging.getLogger('identity_training')
+    pass
 
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 
@@ -86,7 +72,6 @@ class IdentityDataset(Dataset):
         
         for bundle_dir in bundle_dirs:
             bundle_path = self.root_dir / bundle_dir
-            logger.info(f"Loading bundle: {bundle_dir}")
             
             char_dirs = [d for d in os.listdir(bundle_path) if os.path.isdir(bundle_path / d)]
             
@@ -104,7 +89,6 @@ class IdentityDataset(Dataset):
                 
                 pkl_path = os.path.join(char_path, 'char_data.pkl')
                 if not os.path.exists(pkl_path):
-                    logger.warning(f"No char_data.pkl found in {char_path}, skipping")
                     continue
                 
                 image_files.sort()
@@ -118,8 +102,6 @@ class IdentityDataset(Dataset):
                         'reference_file': image_files[self.reference_image_idx],
                         'pkl_path': pkl_path,
                     })
-        
-        logger.info(f"Dataset loaded with {len(self.samples)} images from {len(set([s['char_id'] for s in self.samples]))} characters")
     
     def __len__(self):
         return len(self.samples)
@@ -154,8 +136,7 @@ class IdentityDataset(Dataset):
                 
             if target_label is None:
                 target_label = f"A photo of character {char_id}"
-        except Exception as e:
-            logger.warning(f"Error loading pickle data for {target_img_path}: {e}")
+        except Exception:
             target_label = f"A photo of character {char_id}"
         
         return {
@@ -250,898 +231,539 @@ class IdentityContentLoss(nn.Module):
         return total_loss, loss_dict
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp):
-    model.train()
+    model.set_training_mode(True)
+    running_loss = 0.0
+    all_loss_dicts = []
     
-    if hasattr(model, 'set_training_mode'):
-        model.set_training_mode(True)
-    
-    total_loss = 0
-    face_loss_total = 0
-    body_loss_total = 0
-    content_loss_total = 0
-    
-    pbar = tqdm(dataloader, desc=f"Training")
-    
-    for batch_idx, batch in enumerate(pbar):
-        try:
-            ref_image = batch['reference_image'].to(device)
-            target_image = batch['target_image'].to(device)
-            
-            optimizer.zero_grad()
-            
-            with torch.amp.autocast(device_type='cuda', enabled=use_amp):
-                with torch.no_grad():
-                    ref_face_embed, ref_body_embed, _, _ = model.extract_identity(ref_image)
-                
-                output = model(target_image)
-                
-                if isinstance(output, tuple):
-                    output_image = output[0]
-                else:
-                    output_image = output
-                
-                with torch.no_grad():
-                    output_image_detached = output_image.detach()
-                    output_face_embed, output_body_embed, _, _ = model.extract_identity(output_image_detached)
-                
-                loss, loss_dict = criterion(
-                    ref_face_embed=ref_face_embed,
-                    ref_body_embed=ref_body_embed,
-                    output_face_embed=output_face_embed,
-                    output_body_embed=output_body_embed,
-                    output_image=output_image,
-                    target_image=target_image
+    for batch in tqdm(dataloader, desc="Training"):
+        reference_images = batch['reference_image'].to(device)
+        target_images = batch['target_image'].to(device)
+        
+        optimizer.zero_grad()
+        
+        model.extract_identity(reference_images)
+        
+        with autocast(enabled=use_amp):
+            if hasattr(model, 'generate'):
+                output_images = model.generate(
+                    prompts=[""] * reference_images.size(0),
+                    reference_images=reference_images,
+                    guidance_scale=1.0,
+                    num_inference_steps=1
                 )
+            else:
+                output_images = model(target_images)
             
+            ref_face_embedding = model.reference_face_embedding
+            ref_body_embedding = model.reference_body_embedding
+            
+            output_face_embedding = model.output_face_embedding if hasattr(model, 'output_face_embedding') else None
+            output_body_embedding = model.output_body_embedding if hasattr(model, 'output_body_embedding') else None
+            
+            loss, loss_dict = criterion(
+                ref_face_embedding,
+                ref_body_embedding,
+                output_face_embedding,
+                output_body_embedding,
+                output_images,
+                target_images
+            )
+        
+        if use_amp:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            
-            total_loss += loss.item()
-            face_loss_total += loss_dict.get('face_loss', 0)
-            body_loss_total += loss_dict.get('body_loss', 0)
-            content_loss_total += loss_dict.get('content_loss', 0)
-            
-            pbar.set_postfix({
-                'loss': total_loss / (batch_idx + 1),
-                'face_loss': face_loss_total / (batch_idx + 1),
-                'body_loss': body_loss_total / (batch_idx + 1),
-                'content_loss': content_loss_total / (batch_idx + 1)
-            })
+        else:
+            loss.backward()
+            optimizer.step()
         
-        except Exception as e:
-            logging.error(f"Error processing batch {batch_idx}: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
-            continue
+        running_loss += loss.item()
+        all_loss_dicts.append(loss_dict)
     
-    num_batches = len(dataloader)
-    avg_loss = total_loss / num_batches
-    avg_face_loss = face_loss_total / num_batches
-    avg_body_loss = body_loss_total / num_batches
-    avg_content_loss = content_loss_total / num_batches
+    avg_loss = running_loss / len(dataloader)
+    avg_loss_dict = {k: sum(d[k] for d in all_loss_dicts if k in d) / len(dataloader) for k in all_loss_dicts[0]}
     
-    return {
-        'loss': avg_loss,
-        'face_loss': avg_face_loss,
-        'body_loss': avg_body_loss,
-        'content_loss': avg_content_loss
-    }
+    return avg_loss, avg_loss_dict
 
 def validate(model, dataloader, criterion, device):
     model.eval()
     
-    if hasattr(model, 'set_training_mode'):
-        model.set_training_mode(False)
-    
-    total_loss = 0
-    face_loss_total = 0
-    body_loss_total = 0
-    content_loss_total = 0
-    
-    pbar = tqdm(dataloader, desc=f"Validation")
+    running_loss = 0.0
+    all_loss_dicts = []
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(pbar):
-            try:
-                ref_image = batch['reference_image'].to(device)
-                target_image = batch['target_image'].to(device)
-                
-                ref_face_embed, ref_body_embed, _, _ = model.extract_identity(ref_image)
-                
-                output = model(target_image)
-                
-                if isinstance(output, tuple):
-                    output_image = output[0]
-                else:
-                    output_image = output
-                
-                output_face_embed, output_body_embed, _, _ = model.extract_identity(output_image)
-                
-                loss, loss_dict = criterion(
-                    ref_face_embed=ref_face_embed,
-                    ref_body_embed=ref_body_embed,
-                    output_face_embed=output_face_embed,
-                    output_body_embed=output_body_embed,
-                    output_image=output_image,
-                    target_image=target_image
-                )
-                
-                total_loss += loss.item()
-                face_loss_total += loss_dict.get('face_loss', 0)
-                body_loss_total += loss_dict.get('body_loss', 0)
-                content_loss_total += loss_dict.get('content_loss', 0)
-                
-                pbar.set_postfix({
-                    'loss': total_loss / (batch_idx + 1),
-                    'face_loss': face_loss_total / (batch_idx + 1),
-                    'body_loss': body_loss_total / (batch_idx + 1),
-                    'content_loss': content_loss_total / (batch_idx + 1)
-                })
+        for batch in tqdm(dataloader, desc="Validating"):
+            reference_images = batch['reference_image'].to(device)
+            target_images = batch['target_image'].to(device)
             
-            except Exception as e:
-                logging.error(f"Error processing validation batch {batch_idx}: {e}")
-                import traceback
-                logging.error(traceback.format_exc())
-                continue
+            model.extract_identity(reference_images)
+            
+            if hasattr(model, 'generate'):
+                output_images = model.generate(
+                    prompts=[""] * reference_images.size(0),
+                    reference_images=reference_images,
+                    guidance_scale=1.0,
+                    num_inference_steps=1
+                )
+            else:
+                output_images = model(target_images)
+            
+            ref_face_embedding = model.reference_face_embedding
+            ref_body_embedding = model.reference_body_embedding
+            
+            output_face_embedding = model.output_face_embedding if hasattr(model, 'output_face_embedding') else None
+            output_body_embedding = model.output_body_embedding if hasattr(model, 'output_body_embedding') else None
+            
+            loss, loss_dict = criterion(
+                ref_face_embedding,
+                ref_body_embedding,
+                output_face_embedding,
+                output_body_embedding,
+                output_images,
+                target_images
+            )
+            
+            running_loss += loss.item()
+            all_loss_dicts.append(loss_dict)
     
-    num_batches = len(dataloader)
-    avg_loss = total_loss / num_batches
-    avg_face_loss = face_loss_total / num_batches
-    avg_body_loss = body_loss_total / num_batches
-    avg_content_loss = content_loss_total / num_batches
+    avg_loss = running_loss / len(dataloader)
+    avg_loss_dict = {k: sum(d[k] for d in all_loss_dicts if k in d) / len(dataloader) for k in all_loss_dicts[0]}
     
-    return {
-        'loss': avg_loss,
-        'face_loss': avg_face_loss,
-        'body_loss': avg_body_loss,
-        'content_loss': avg_content_loss
-    }
+    return avg_loss, avg_loss_dict
 
 def visualize_examples(examples, epoch):
-    if not examples:
-        logger.warning("No examples provided for visualization")
-        return
+    plt.figure(figsize=(12, 10))
+    for i, (ref_img, target_img, output_img) in enumerate(examples):
+        plt.subplot(len(examples), 3, i * 3 + 1)
+        plt.imshow(ref_img)
+        plt.title(f"Reference {i+1}")
+        plt.axis('off')
+        
+        plt.subplot(len(examples), 3, i * 3 + 2)
+        plt.imshow(target_img)
+        plt.title(f"Target {i+1}")
+        plt.axis('off')
+        
+        plt.subplot(len(examples), 3, i * 3 + 3)
+        plt.imshow(output_img)
+        plt.title(f"Output {i+1}")
+        plt.axis('off')
     
-    try:
-        num_examples = len(examples)
-        fig, axes = plt.subplots(num_examples, 3, figsize=(15, 5 * num_examples))
-        
-        if num_examples == 1:
-            axes = [axes]
-        
-        for i, example in enumerate(examples):
-            try:
-                ref_img = example['reference'].permute(1, 2, 0).numpy()
-                target_img = example['target'].permute(1, 2, 0).numpy()
-                output_img = example['output'].permute(1, 2, 0).numpy()
-                
-                for img, name in [(ref_img, 'reference'), (target_img, 'target'), (output_img, 'output')]:
-                    if np.isnan(img).any():
-                        logger.warning(f"NaN values detected in {name} image")
-                        img = np.nan_to_num(img)
-                    if np.isinf(img).any():
-                        logger.warning(f"Inf values detected in {name} image")
-                        img = np.nan_to_num(img, posinf=1.0, neginf=0.0)
-                
-                for img, name in [(ref_img, 'reference'), (target_img, 'target'), (output_img, 'output')]:
-                    min_val = img.min()
-                    max_val = img.max()
-                    if min_val == max_val:
-                        logger.warning(f"{name} image has constant values, skipping normalization")
-                    else:
-                        img = (img - min_val) / (max_val - min_val)
-                        
-                ref_img = np.clip(ref_img, 0, 1)
-                target_img = np.clip(target_img, 0, 1)
-                output_img = np.clip(output_img, 0, 1)
-                
-                axes[i][0].imshow(ref_img)
-                axes[i][0].set_title("Reference")
-                axes[i][0].axis('off')
-                
-                axes[i][1].imshow(target_img)
-                axes[i][1].set_title("Target")
-                axes[i][1].axis('off')
-                
-                axes[i][2].imshow(output_img)
-                axes[i][2].set_title("Output")
-                axes[i][2].axis('off')
-            except Exception as e:
-                logger.error(f"Error processing example {i}: {e}")
-                continue
-        
-        plt.tight_layout()
-        
-        if 'wandb' in sys.modules and wandb.run is not None:
-            try:
-                wandb.log({f"examples/epoch_{epoch}": wandb.Image(fig)})
-            except Exception as e:
-                logger.error(f"Error logging to wandb: {e}")
-        
-        plt.close(fig)
-    except Exception as e:
-        logger.error(f"Error in visualize_examples: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+    plt.tight_layout()
+    return plt.gcf()
 
 def identity_similarity_metrics(model, test_loader, device):
     model.eval()
-    metrics = {
-        'face_cos_similarity': [],
-        'body_cos_similarity': [],
-        'face_l2_distance': [],
-        'body_l2_distance': [],
-    }
     
-    cosine_sim = nn.CosineSimilarity(dim=2)
+    face_sims = []
+    body_sims = []
+    content_sims = []
+    
+    cosine_sim = nn.CosineSimilarity(dim=1)
+    mse_loss = nn.MSELoss(reduction='none')
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Computing metrics"):
             reference_images = batch['reference_image'].to(device)
             target_images = batch['target_image'].to(device)
             
-            ref_face_emb, ref_body_emb, _, _ = model.extract_identity(reference_images)
+            model.extract_identity(reference_images)
             
-            model.prepare_identity_tokens(ref_face_emb, ref_body_emb)
+            if hasattr(model, 'generate'):
+                output_images = model.generate(
+                    prompts=[""] * reference_images.size(0),
+                    reference_images=reference_images,
+                    guidance_scale=1.0,
+                    num_inference_steps=1
+                )
+            else:
+                output_images = model(target_images)
             
-            output = model(target_images)
+            ref_face_embed = model.reference_face_embedding
+            ref_body_embed = model.reference_body_embedding
             
-            output_face_emb, output_body_emb, _, _ = model.extract_identity(output)
+            output_face_embed = model.output_face_embedding if hasattr(model, 'output_face_embedding') else None
+            output_body_embed = model.output_body_embedding if hasattr(model, 'output_body_embedding') else None
             
-            target_face_emb, target_body_emb, _, _ = model.extract_identity(target_images)
+            if ref_face_embed is not None and output_face_embed is not None:
+                ref_face_flat = ref_face_embed.view(ref_face_embed.size(0), -1)
+                output_face_flat = output_face_embed.view(output_face_embed.size(0), -1)
+                
+                face_sim = cosine_sim(ref_face_flat, output_face_flat)
+                face_sims.extend(face_sim.cpu().numpy())
             
-            if output_face_emb.shape == target_face_emb.shape:
-                face_cos = cosine_sim(output_face_emb, target_face_emb).mean().item()
-                metrics['face_cos_similarity'].append(face_cos)
+            if ref_body_embed is not None and output_body_embed is not None:
+                ref_body_flat = ref_body_embed.view(ref_body_embed.size(0), -1)
+                output_body_flat = output_body_embed.view(output_body_embed.size(0), -1)
+                
+                body_sim = cosine_sim(ref_body_flat, output_body_flat)
+                body_sims.extend(body_sim.cpu().numpy())
             
-            if output_body_emb.shape == target_body_emb.shape:
-                body_cos = cosine_sim(output_body_emb, target_body_emb).mean().item()
-                metrics['body_cos_similarity'].append(body_cos)
-            
-            if output_face_emb.shape == target_face_emb.shape:
-                face_l2 = torch.norm(output_face_emb - target_face_emb, dim=2).mean().item()
-                metrics['face_l2_distance'].append(face_l2)
-            
-            if output_body_emb.shape == target_body_emb.shape:
-                body_l2 = torch.norm(output_body_emb - target_body_emb, dim=2).mean().item()
-                metrics['body_l2_distance'].append(body_l2)
+            pix_wise_mse = mse_loss(output_images, target_images).mean(dim=(1, 2, 3))
+            content_sims.extend((-pix_wise_mse).cpu().numpy())
     
-    avg_metrics = {}
-    for key, values in metrics.items():
-        if values:
-            avg_metrics[key] = sum(values) / len(values)
-        else:
-            avg_metrics[key] = float('nan')
+    metrics = {}
+    if face_sims:
+        metrics['face_similarity'] = np.mean(face_sims)
+    if body_sims:
+        metrics['body_similarity'] = np.mean(body_sims)
+    if content_sims:
+        metrics['content_similarity'] = np.mean(content_sims)
     
-    return avg_metrics
+    return metrics
 
 def init_model(input_size=512, device='cuda'):
-    try:
-        model = IdentityPreservingFlux(
-            use_gpu=device=='cuda',
-            cache_dir="./cache"
-        )
-        model = model.to(device)
-        
-        model.load_base_model()
-        
-        logger.info(f"Created IdentityPreservingFlux with input size {input_size} on device {device}")
-        
-        return model
-    except Exception as e:
-        logging.error(f"Error initializing IdentityPreservingFlux model: {e}")
-        import traceback
-        logging.error(traceback.format_exc())
-        raise
+    model = IdentityPreservingFlux(
+        use_gpu=(device == 'cuda'),
+        cache_dir=None
+    )
+    
+    model = model.to(device)
+    
+    return model
 
 def custom_collate_fn(batch):
-    processed_batch = []
-    for item in batch:
-        processed_item = {}
-        for key, value in item.items():
-            if isinstance(value, Image.Image):
-                transform = transforms.Compose([
-                    transforms.Resize((512, 512)),
-                    transforms.ToTensor()
-                ])
-                value = transform(value)
-            processed_item[key] = value
-        processed_batch.append(processed_item)
+    batch_dict = {
+        'reference_image': torch.stack([item['reference_image'] for item in batch]),
+        'target_image': torch.stack([item['target_image'] for item in batch]),
+        'source_image': torch.stack([item['source_image'] for item in batch]),
+        'char_id': [item['char_id'] for item in batch],
+        'target_path': [item['target_path'] for item in batch],
+        'reference_path': [item['reference_path'] for item in batch],
+        'target_label': [item['target_label'] for item in batch],
+    }
     
-    return torch.utils.data.dataloader.default_collate(processed_batch)
+    return batch_dict
 
 def visualize_results(model, dataloader, output_dir, device, epoch, max_samples=8, dpi=150):
-    viz_dir = os.path.join(output_dir, 'visualizations')
-    os.makedirs(viz_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
     
-    model.set_training_mode(False)
-    
-    batch = next(iter(dataloader))
-    source_images = batch['reference_image'].to(device)
-    target_images = batch['target_image'].to(device)
-    char_ids = batch['char_id']
-    
-    source_images = source_images[:max_samples]
-    target_images = target_images[:max_samples]
-    char_ids = char_ids[:max_samples]
-    
-    n_samples = source_images.shape[0]
-    grid_size = int(np.ceil(np.sqrt(n_samples)))
+    examples = []
+    to_pil = transforms.ToPILImage()
     
     with torch.no_grad():
-        ref_face_emb, ref_body_emb, _, _ = model.extract_identity(source_images)
-        
-        model.prepare_identity_tokens(ref_face_emb, ref_body_emb)
-        
-        output_images = model(target_images)
-        
-        out_face_emb, out_body_emb, _, _ = model.extract_identity(output_images)
+        for i, batch in enumerate(dataloader):
+            if i >= max_samples:
+                break
+                
+            reference_images = batch['reference_image'].to(device)
+            target_images = batch['target_image'].to(device)
+            
+            model.extract_identity(reference_images)
+            
+            if hasattr(model, 'generate'):
+                output_images = model.generate(
+                    prompts=[""] * reference_images.size(0),
+                    reference_images=reference_images,
+                    guidance_scale=1.0,
+                    num_inference_steps=1
+                )
+            else:
+                output_images = model(target_images)
+            
+            for j in range(min(len(reference_images), 1)):
+                ref_img = to_pil(reference_images[j].cpu())
+                target_img = to_pil(target_images[j].cpu())
+                output_img = to_pil(output_images[j].cpu())
+                
+                examples.append((
+                    np.array(ref_img),
+                    np.array(target_img),
+                    np.array(output_img)
+                ))
+                
+                ref_img.save(os.path.join(output_dir, f"epoch_{epoch}_sample_{i}_reference.png"))
+                target_img.save(os.path.join(output_dir, f"epoch_{epoch}_sample_{i}_target.png"))
+                output_img.save(os.path.join(output_dir, f"epoch_{epoch}_sample_{i}_output.png"))
     
-    cosine_sim = nn.CosineSimilarity(dim=1)
-    face_sim = cosine_sim(ref_face_emb.view(ref_face_emb.size(0), -1), 
-                         out_face_emb.view(out_face_emb.size(0), -1)).cpu().numpy()
-    body_sim = cosine_sim(ref_body_emb.view(ref_body_emb.size(0), -1), 
-                         out_body_emb.view(out_body_emb.size(0), -1)).cpu().numpy()
+    comparison_fig = visualize_examples(examples, epoch)
+    comparison_fig.savefig(os.path.join(output_dir, f"epoch_{epoch}_comparisons.png"), dpi=dpi)
+    plt.close(comparison_fig)
     
-    source_np = source_images.detach().cpu().permute(0, 2, 3, 1).numpy()
-    target_np = target_images.detach().cpu().permute(0, 2, 3, 1).numpy()
-    output_np = output_images.detach().cpu().permute(0, 2, 3, 1).numpy()
+    # Identity attention visualization
+    if hasattr(model, 'visualize_attention'):
+        try:
+            attn_fig = model.visualize_attention()
+            if attn_fig:
+                attn_fig.savefig(os.path.join(output_dir, f"epoch_{epoch}_attention.png"), dpi=dpi)
+                plt.close(attn_fig)
+        except Exception:
+            pass
     
-    source_np = np.clip(source_np, 0, 1)
-    target_np = np.clip(target_np, 0, 1)
-    output_np = np.clip(output_np, 0, 1)
+    # If model has a method to save its own visualization
+    if hasattr(model, 'save_visualization'):
+        try:
+            model.save_visualization(os.path.join(output_dir, f"epoch_{epoch}_model_viz.png"))
+        except Exception:
+            pass
     
-    fig = plt.figure(figsize=(15, 5 * n_samples))
-    
-    for i in range(n_samples):
-        ax1 = fig.add_subplot(n_samples, 3, i*3 + 1)
-        ax1.imshow(source_np[i])
-        ax1.set_title(f"Source: {char_ids[i]}")
-        ax1.axis('off')
-        
-        ax2 = fig.add_subplot(n_samples, 3, i*3 + 2)
-        ax2.imshow(target_np[i])
-        ax2.set_title("Target")
-        ax2.axis('off')
-        
-        ax3 = fig.add_subplot(n_samples, 3, i*3 + 3)
-        ax3.imshow(output_np[i])
-        ax3.set_title(f"Generated (Face Sim: {face_sim[i]:.2f}, Body Sim: {body_sim[i]:.2f})")
-        ax3.axis('off')
-    
-    plt.tight_layout()
-    viz_path = os.path.join(viz_dir, f"epoch_{epoch:03d}.png")
-    plt.savefig(viz_path, dpi=dpi)
-    
-    latest_path = os.path.join(viz_dir, "latest.png")
-    plt.savefig(latest_path, dpi=dpi)
-    
-    plt.close()
-    
-    if n_samples >= 4:
-        grid_fig = plt.figure(figsize=(15, 15))
-        
-        gs = grid_fig.add_gridspec(3, 1, height_ratios=[1, 1, 1])
-        
-        ax_source = grid_fig.add_subplot(gs[0])
-        source_grid = torchvision.utils.make_grid(source_images[:16], nrow=4, normalize=True)
-        ax_source.imshow(source_grid.permute(1, 2, 0).cpu().numpy())
-        ax_source.set_title("Source Images")
-        ax_source.axis('off')
-        
-        ax_target = grid_fig.add_subplot(gs[1])
-        target_grid = torchvision.utils.make_grid(target_images[:16], nrow=4, normalize=True)
-        ax_target.imshow(target_grid.permute(1, 2, 0).cpu().numpy())
-        ax_target.set_title("Target Images")
-        ax_target.axis('off')
-        
-        ax_output = grid_fig.add_subplot(gs[2])
-        output_grid = torchvision.utils.make_grid(output_images[:16], nrow=4, normalize=True)
-        ax_output.imshow(output_grid.permute(1, 2, 0).cpu().numpy())
-        ax_output.set_title("Generated Images")
-        ax_output.axis('off')
-        
-        plt.tight_layout()
-        grid_path = os.path.join(viz_dir, f"grid_epoch_{epoch:03d}.png")
-        plt.savefig(grid_path, dpi=dpi)
-        
-        latest_grid_path = os.path.join(viz_dir, "latest_grid.png")
-        plt.savefig(latest_grid_path, dpi=dpi)
-        
-        plt.close()
-    
-    model.set_training_mode(True)
-    
-    logging.info(f"Saved visualizations to {viz_path}")
-    
-    return viz_path
+    return examples
 
 def plot_losses(train_losses, val_losses, output_dir, current_epoch, dpi=150):
-    plt.figure(figsize=(15, 10))
+    os.makedirs(output_dir, exist_ok=True)
     
-    plot_dir = os.path.join(output_dir, 'plots')
-    os.makedirs(plot_dir, exist_ok=True)
+    plt.figure(figsize=(12, 6))
+    epochs = list(range(1, len(train_losses) + 1))
     
-    plt.subplot(2, 2, 1)
-    plt.plot(train_losses['total'], label='Train Loss')
-    plt.plot(val_losses['total'], label='Val Loss')
-    plt.title('Total Loss')
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
+    if val_losses:
+        plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, linestyle='--', alpha=0.7)
     
-    plt.subplot(2, 2, 2)
-    plt.plot(train_losses['face'], label='Train Face Loss')
-    plt.plot(val_losses['face'], label='Val Face Loss')
-    plt.title('Face Identity Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(2, 2, 3)
-    plt.plot(train_losses['body'], label='Train Body Loss')
-    plt.plot(val_losses['body'], label='Val Body Loss')
-    plt.title('Body Identity Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    plt.subplot(2, 2, 4)
-    plt.plot(train_losses['content'], label='Train Content Loss')
-    plt.plot(val_losses['content'], label='Val Content Loss')
-    plt.title('Content Preservation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
+    if len(train_losses) > 1:
+        # Plot the recent trend in a separate graph
+        window_size = min(10, len(train_losses))
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs[-window_size:], train_losses[-window_size:], 'b-', label='Training Loss')
+        if val_losses:
+            plt.plot(epochs[-window_size:], val_losses[-window_size:], 'r-', label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Recent Loss Trend (Last {window_size} Epochs)')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.7)
     
     plt.tight_layout()
-    
-    plot_path = os.path.join(plot_dir, f'losses_epoch_{current_epoch:03d}.png')
-    plt.savefig(plot_path, dpi=dpi)
-    
-    latest_path = os.path.join(plot_dir, 'latest_losses.png')
-    plt.savefig(latest_path, dpi=dpi)
-    
+    plt.savefig(os.path.join(output_dir, f"loss_plot_epoch_{current_epoch}.png"), dpi=dpi)
     plt.close()
-    
-    logging.info(f"Saved loss plots to {plot_path}")
-    
-    return plot_path
 
 def main(config):
-    try:
-        logging_level = getattr(logging, config.get('log_level', 'INFO').upper())
-        logging.basicConfig(level=logging_level, 
-                          format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        
-        logging.info("Starting identity-preserving model training...")
-        
-        data_dir = config.get('dataset_root', '/workspace/dtback/train/dataset')
-        if not os.path.isabs(data_dir):
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            data_dir_candidate = os.path.join(script_dir, data_dir)
-            
-            if not os.path.exists(data_dir_candidate):
-                workspace_root = os.path.dirname(script_dir)
-                data_dir = os.path.join(workspace_root, data_dir)
-            else:
-                data_dir = data_dir_candidate
-            
-        if not os.path.exists(data_dir):
-            logging.error(f"Dataset directory not found: {data_dir}")
-            raise FileNotFoundError(f"Dataset directory not found: {data_dir}")
-        else:
-            logging.info(f"Using dataset directory: {data_dir}")
-            
-        output_dir = config.get('output_dir', 'checkpoints/identity_preserving')
-        if not os.path.isabs(output_dir):
-            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), output_dir)
-            
-        if not os.path.exists(output_dir):
-            logging.info(f"Creating output directory: {output_dir}")
-            os.makedirs(output_dir, exist_ok=True)
-            
-        cache_dir = config.get('cache_dir', 'cache/identity_preserving')
-        if not os.path.isabs(cache_dir):
-            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_dir)
-            
-        if not os.path.exists(cache_dir):
-            logging.info(f"Creating cache directory: {cache_dir}")
-            os.makedirs(cache_dir, exist_ok=True)
-            
-        batch_size = config.get('batch_size', 4)
-        
-        num_epochs = config.get('num_epochs', 50)
-        learning_rate = config.get('learning_rate', 3e-4)
-        face_weight = config.get('face_weight', 1.0)
-        body_weight = config.get('body_weight', 0.5)
-        content_weight = config.get('content_weight', 0.5)
-        
-        use_amp = config.get('use_amp', True)
-        
-        input_size = config.get('input_size', 512)
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
+    device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+    seed = config.get('seed', 42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    # Initialize WandB if enabled
+    use_wandb = config.get('use_wandb', False)
+    if use_wandb:
         try:
-            model = init_model(input_size=input_size, device=device)
-            model.to(device)
-            logging.info(f"Model created on device: {device}")
-        except Exception as e:
-            logging.error(f"Error initializing model: {e}")
-            logging.error("Falling back to default initialization")
-            model = IdentityPreservingFlux(
-                use_gpu=device=='cuda',
-                cache_dir="./cache"
+            run = wandb.init(
+                project=config.get('wandb_project', 'identity-preserving-flux'),
+                name=config.get('run_name', f"run_{int(time.time())}"),
+                config=config
             )
-            model.to(device)
+        except Exception:
+            use_wandb = False
+    
+    # Create transforms
+    input_size = config.get('input_size', 512)
+    transform = transforms.Compose([
+        transforms.Resize((input_size, input_size)),
+        transforms.ToTensor(),
+    ])
+    
+    # Create dataset
+    dataset = IdentityDataset(
+        root_dir=config.get('data_dir', 'dataset'),
+        bundle_dirs=config.get('bundle_dirs', None),
+        max_chars_per_bundle=config.get('max_chars_per_bundle', 20),
+        transform=transform,
+        use_cache=config.get('use_cache', True),
+        cache_dir=config.get('cache_dir', None),
+        min_images_per_char=config.get('min_images_per_char', 3),
+        reference_image_idx=config.get('reference_image_idx', 0)
+    )
+    
+    # Split into train, val, test sets
+    val_split = config.get('val_split', 0.1)
+    test_split = config.get('test_split', 0.1)
+    
+    dataset_size = len(dataset)
+    val_size = int(dataset_size * val_split)
+    test_size = int(dataset_size * test_split)
+    train_size = dataset_size - val_size - test_size
+    
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(seed)
+    )
+    
+    batch_size = config.get('batch_size', 4)
+    num_workers = config.get('num_workers', 2)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=device == 'cuda'
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=device == 'cuda'
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=device == 'cuda'
+    )
+    
+    # Initialize model
+    model = init_model(input_size=input_size, device=device)
+    
+    # Initialize criterion
+    criterion = IdentityContentLoss(
+        face_weight=config.get('face_weight', 1.0),
+        body_weight=config.get('body_weight', 0.5),
+        content_weight=config.get('content_weight', 0.5),
+        device=device
+    )
+    
+    # Initialize optimizer
+    learning_rate = config.get('learning_rate', 0.0001)
+    weight_decay = config.get('weight_decay', 0.00001)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay
+    )
+    
+    # Initialize scheduler
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.5,
+        patience=5,
+        verbose=False
+    )
+    
+    # Initialize amp scaler
+    use_amp = config.get('use_amp', False) and device == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    
+    num_epochs = config.get('num_epochs', 20)
+    log_interval = config.get('log_interval', 5)
+    save_interval = config.get('save_interval', 1)
+    
+    output_dir = config.get('output_dir', './checkpoints')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Training loop
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    for epoch in range(1, num_epochs + 1):
+        start_time = time.time()
         
-        if hasattr(model, 'set_training_mode'):
-            logging.info("Model has custom set_training_mode method - will use this instead of train()")
+        train_loss, train_loss_dict = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, use_amp
+        )
         
-        criterion = IdentityContentLoss(
-            face_weight=face_weight,
-            body_weight=body_weight,
-            content_weight=content_weight,
-            device=device
-        ).to(device)
+        val_loss = None
+        val_loss_dict = None
         
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=config.get('weight_decay', 1e-5))
+        if val_loader:
+            val_loss, val_loss_dict = validate(model, val_loader, criterion, device)
+            scheduler.step(val_loss)
         
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        train_losses.append(train_loss)
+        if val_loss is not None:
+            val_losses.append(val_loss)
         
-        bundle_dirs = None
-        if 'bundle_dirs' in config:
-            bundle_dirs = config.get('bundle_dirs')
-            logging.info(f"Using specified bundle directories: {bundle_dirs}")
-        else:
-            bundle_dirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
-            logging.info(f"Discovered bundle directories: {bundle_dirs}")
+        epoch_time = time.time() - start_time
         
-        try:
-            dataset = IdentityDataset(
-                root_dir=data_dir,
-                bundle_dirs=bundle_dirs,
-                max_chars_per_bundle=config.get('max_chars_per_bundle', 100),
-                transform=None,
-                use_cache=config.get('use_cache', True),
-                cache_dir=cache_dir,
-                min_images_per_char=config.get('min_images_per_char', 3),
-                reference_image_idx=config.get('reference_image_idx', 0)
-            )
-            
-            train_size = int(0.8 * len(dataset))
-            val_size = int(0.1 * len(dataset))
-            test_size = len(dataset) - train_size - val_size
-            
-            train_dataset, val_dataset, test_dataset = random_split(
-                dataset, [train_size, val_size, test_size]
-            )
-            
-            logging.info(f"Dataset split: Train={len(train_dataset)}, Validation={len(val_dataset)}, Test={len(test_dataset)}")
-            
-            train_loader = DataLoader(
-                train_dataset, 
-                batch_size=batch_size, 
-                shuffle=True, 
-                num_workers=config.get('num_workers', 4),
-                pin_memory=True,
-                collate_fn=custom_collate_fn
-            )
-            
-            val_loader = DataLoader(
-                val_dataset, 
-                batch_size=batch_size, 
-                shuffle=False, 
-                num_workers=config.get('num_workers', 4),
-                pin_memory=True,
-                collate_fn=custom_collate_fn
-            )
-            
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=config.get('num_workers', 4),
-                pin_memory=True,
-                collate_fn=custom_collate_fn
-            )
-        except Exception as e:
-            logging.error(f"Error creating dataset: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
-            raise
+        if epoch % log_interval == 0 or epoch == num_epochs:
+            plot_losses(train_losses, val_losses, output_dir, epoch)
         
-        logging.info("Starting training...")
-        best_val_loss = float('inf')
-        
-        train_losses = {
-            'total': [],
-            'face': [],
-            'body': [],
-            'content': []
-        }
-        
-        val_losses = {
-            'total': [],
-            'face': [],
-            'body': [],
-            'content': []
-        }
-        
-        viz_dir = os.path.join(output_dir, 'visualizations')
-        os.makedirs(viz_dir, exist_ok=True)
-        
-        viz_interval = config.get('viz_interval', 1)
-        
-        for epoch in range(1, num_epochs + 1):
-            try:
-                logging.info(f"Starting epoch {epoch}/{num_epochs}")
-                
-                train_metrics = train_one_epoch(
-                    model=model,
-                    dataloader=train_loader,
-                    criterion=criterion,
-                    optimizer=optimizer,
-                    device=device,
-                    scaler=scaler,
-                    use_amp=use_amp
-                )
-                
-                val_metrics = validate(
-                    model=model,
-                    dataloader=val_loader,
-                    criterion=criterion,
-                    device=device
-                )
-                
-                train_losses['total'].append(train_metrics['loss'])
-                train_losses['face'].append(train_metrics['face_loss'])
-                train_losses['body'].append(train_metrics['body_loss'])
-                train_losses['content'].append(train_metrics['content_loss'])
-                
-                val_losses['total'].append(val_metrics['loss'])
-                val_losses['face'].append(val_metrics['face_loss'])
-                val_losses['body'].append(val_metrics['body_loss'])
-                val_losses['content'].append(val_metrics['content_loss'])
-                
-                logging.info(f"Epoch {epoch}/{num_epochs}, Train Loss: {train_metrics['loss']:.4f}, Val Loss: {val_metrics['loss']:.4f}")
-                logging.info(f"  Face Loss: Train={train_metrics['face_loss']:.4f}, Val={val_metrics['face_loss']:.4f}")
-                logging.info(f"  Body Loss: Train={train_metrics['body_loss']:.4f}, Val={val_metrics['body_loss']:.4f}")
-                logging.info(f"  Content Loss: Train={train_metrics['content_loss']:.4f}, Val={val_metrics['content_loss']:.4f}")
-                
-                loss_plot_path = plot_losses(
-                    train_losses=train_losses,
-                    val_losses=val_losses,
-                    output_dir=output_dir,
-                    current_epoch=epoch,
-                    dpi=config.get('viz_dpi', 150)
-                )
-                
-                if epoch % viz_interval == 0 or epoch == 1 or epoch == num_epochs:
-                    try:
-                        visualization_path = visualize_results(
-                            model=model,
-                            dataloader=val_loader,
-                            output_dir=output_dir,
-                            device=device,
-                            epoch=epoch,
-                            max_samples=config.get('viz_samples', 8),
-                            dpi=config.get('viz_dpi', 150)
-                        )
-                        logging.info(f"Saved visualization to {visualization_path}")
-                    except Exception as e:
-                        logging.error(f"Error generating visualizations: {e}")
-                        import traceback
-                        logging.error(traceback.format_exc())
-                
-                if val_metrics['loss'] < best_val_loss:
-                    best_val_loss = val_metrics['loss']
-                    checkpoint_path = os.path.join(output_dir, f"best_model.safetensors")
-                    state_dict = {
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'train_loss': train_metrics['loss'],
-                        'val_loss': val_metrics['loss'],
-                        'face_loss': val_metrics['face_loss'],
-                        'body_loss': val_metrics['body_loss'],
-                        'content_loss': val_metrics['content_loss'],
-                    }
-                    metadata = {}
-                    tensors = {}
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            tensors[k] = v
-                        elif k == 'model_state_dict' or k == 'optimizer_state_dict':
-                            for param_key, param_value in v.items():
-                                if isinstance(param_value, torch.Tensor):
-                                    tensors[f"{k}.{param_key}"] = param_value
-                        else:
-                            metadata[k] = str(v)
-                    
-                    save_file(tensors, checkpoint_path, metadata=metadata)
-                    logging.info(f"Saved best model checkpoint to {checkpoint_path}")
-                    
-                    best_epoch_path = os.path.join(output_dir, f"best_model_epoch_{epoch}.safetensors")
-                    save_file(tensors, best_epoch_path, metadata=metadata)
-                
-                if epoch % config.get('save_interval', 10) == 0 or epoch == num_epochs:
-                    checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch}.safetensors")
-                    state_dict = {
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'train_loss': train_metrics['loss'],
-                        'val_loss': val_metrics['loss'],
-                        'face_loss': val_metrics['face_loss'],
-                        'body_loss': val_metrics['body_loss'],
-                        'content_loss': val_metrics['content_loss'],
-                    }
-                    metadata = {}
-                    tensors = {}
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor):
-                            tensors[k] = v
-                        elif k == 'model_state_dict' or k == 'optimizer_state_dict':
-                            for param_key, param_value in v.items():
-                                if isinstance(param_value, torch.Tensor):
-                                    tensors[f"{k}.{param_key}"] = param_value
-                        else:
-                            metadata[k] = str(v)
-                    
-                    save_file(tensors, checkpoint_path, metadata=metadata)
-                    logging.info(f"Saved checkpoint to {checkpoint_path}")
-                    
-                loss_history = {
-                    'train_losses': train_losses,
-                    'val_losses': val_losses,
-                    'epochs': list(range(1, epoch + 1))
-                }
-                loss_history_path = os.path.join(output_dir, 'loss_history.pkl')
-                with open(loss_history_path, 'wb') as f:
-                    pickle.dump(loss_history, f)
-                logging.info(f"Saved loss history to {loss_history_path}")
-                    
-            except Exception as e:
-                logging.error(f"Error in epoch {epoch}: {e}")
-                import traceback
-                logging.error(traceback.format_exc())
-                continue
-        
-        try:
-            test_metrics = validate(
-                model=model,
-                dataloader=test_loader,
-                criterion=criterion,
-                device=device
-            )
-            logging.info(f"Test Loss: {test_metrics['loss']:.4f}")
-            logging.info(f"  Face Loss: {test_metrics['face_loss']:.4f}")
-            logging.info(f"  Body Loss: {test_metrics['body_loss']:.4f}")
-            logging.info(f"  Content Loss: {test_metrics['content_loss']:.4f}")
-            
-            try:
-                final_viz_path = visualize_results(
-                    model=model,
-                    dataloader=test_loader,
-                    output_dir=output_dir,
-                    device=device,
-                    epoch=9999,
-                    max_samples=config.get('viz_samples', 16),
-                    dpi=config.get('viz_dpi', 150)
-                )
-                logging.info(f"Saved final test set visualization to {final_viz_path}")
-            except Exception as e:
-                logging.error(f"Error generating final visualizations: {e}")
-                import traceback
-                logging.error(traceback.format_exc())
-            
-            final_path = os.path.join(output_dir, "final_model.safetensors")
-            state_dict = {
-                'epoch': num_epochs,
-                'model_state_dict': model.state_dict(),
-                'test_loss': test_metrics['loss'],
-                'face_loss': test_metrics['face_loss'],
-                'body_loss': test_metrics['body_loss'],
-                'content_loss': test_metrics['content_loss'],
+        # Log metrics
+        if use_wandb:
+            log_dict = {
+                'epoch': epoch,
+                'train_loss': train_loss,
+                'epoch_time': epoch_time,
             }
-            metadata = {}
-            tensors = {}
-            for k, v in state_dict.items():
-                if isinstance(v, torch.Tensor):
-                    tensors[k] = v
-                elif k == 'model_state_dict':
-                    for param_key, param_value in v.items():
-                        if isinstance(param_value, torch.Tensor):
-                            tensors[f"{k}.{param_key}"] = param_value
-                else:
-                    metadata[k] = str(v)
-                    
-            save_file(tensors, final_path, metadata=metadata)
-            logging.info(f"Saved final model to {final_path}")
             
-        except Exception as e:
-            logging.error(f"Error in final evaluation: {e}")
-            import traceback
-            logging.error(traceback.format_exc())
+            if train_loss_dict:
+                for k, v in train_loss_dict.items():
+                    log_dict[f'train_{k}'] = v
+            
+            if val_loss is not None:
+                log_dict['val_loss'] = val_loss
+                
+                if val_loss_dict:
+                    for k, v in val_loss_dict.items():
+                        log_dict[f'val_{k}'] = v
+            
+            wandb.log(log_dict)
         
-        return True
+        # Save checkpoints
+        if (epoch % save_interval == 0 or epoch == num_epochs):
+            checkpoint_path = os.path.join(output_dir, f"epoch_{epoch}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'config': config,
+            }, checkpoint_path)
+            
+            # Also save a safe tensors version
+            safetensors_path = os.path.join(output_dir, f"epoch_{epoch}.safetensors")
+            save_file(model.state_dict(), safetensors_path, metadata={"epoch": str(epoch)})
+            
+            # Visualize results
+            _ = visualize_results(
+                model, test_loader, os.path.join(output_dir, f"epoch_{epoch}"),
+                device, epoch, max_samples=config.get('max_viz_samples', 8)
+            )
         
-    except Exception as e:
-        logging.error(f"Error in main training function: {e}")
-        import traceback
-        logging.error(traceback.format_exc())
-        return False
+        # Save best model
+        if val_loss is not None and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_path = os.path.join(output_dir, "best_model.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'config': config,
+            }, best_model_path)
+            
+            # Also save a safe tensors version
+            best_safetensors_path = os.path.join(output_dir, "best_model.safetensors")
+            save_file(model.state_dict(), best_safetensors_path, metadata={"epoch": str(epoch)})
+    
+    # Final evaluation on test set
+    test_metrics = identity_similarity_metrics(model, test_loader, device)
+    
+    if use_wandb:
+        wandb.log(test_metrics)
+        wandb.finish()
+    
+    return model, test_metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train identity preserving model")
-    
-    parser.add_argument('--dataset_root', type=str, default='/workspace/dtback/train/dataset',
-                        help="Root directory of the dataset")
-    parser.add_argument('--batch_size', type=int, default=4,
-                        help="Batch size for training")
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help="Number of data loading workers")
-    parser.add_argument('--val_split', type=float, default=0.1,
-                        help="Validation split ratio")
-    
-    parser.add_argument('--input_size', type=tuple, default=(512, 512),
-                        help="Input image size")
-    
-    parser.add_argument('--face_weight', type=float, default=1.0,
-                        help="Weight for face identity loss")
-    parser.add_argument('--body_weight', type=float, default=0.5,
-                        help="Weight for body identity loss")
-    parser.add_argument('--content_weight', type=float, default=0.5,
-                        help="Weight for content preservation loss")
-    
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help="Learning rate")
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                        help="Weight decay for optimizer")
-    parser.add_argument('--num_epochs', type=int, default=50,
-                        help="Number of training epochs")
-    parser.add_argument('--seed', type=int, default=42,
-                        help="Random seed for reproducibility")
-    parser.add_argument('--device', type=str, default=None,
-                        help="Device to train on (cuda or cpu)")
-    parser.add_argument('--use_amp', action='store_true',
-                        help="Use automatic mixed precision")
-    
-    parser.add_argument('--output_dir', type=str, default='./checkpoints/identity_preserving',
-                        help="Directory to save model checkpoints")
-    parser.add_argument('--log_interval', type=int, default=10,
-                        help="Interval for logging batch results")
-    parser.add_argument('--val_interval', type=int, default=1,
-                        help="Interval for validation (in epochs)")
-    parser.add_argument('--save_interval', type=int, default=5,
-                        help="Interval for saving checkpoints (in epochs)")
-    
-    parser.add_argument('--viz_interval', type=int, default=1,
-                        help="Interval for generating visualizations (in epochs)")
-    parser.add_argument('--viz_samples', type=int, default=8,
-                        help="Number of samples to visualize")
-    parser.add_argument('--viz_dpi', type=int, default=150,
-                        help="DPI for saved visualizations")
-    
-    parser.add_argument('--use_wandb', action='store_true',
-                        help="Use Weights & Biases for logging")
-    parser.add_argument('--wandb_project', type=str, default='identity-preserving-flux',
-                        help="Weights & Biases project name")
-    parser.add_argument('--wandb_entity', type=str, default=None,
-                        help="Weights & Biases entity name")
-    parser.add_argument('--wandb_name', type=str, default=None,
-                        help="Weights & Biases run name")
-    
+    parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
     args = parser.parse_args()
     
-    config = vars(args)
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
     
     main(config) 
